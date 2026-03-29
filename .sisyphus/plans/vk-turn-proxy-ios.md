@@ -991,7 +991,7 @@ Max Concurrent: 3 (Waves 1 & 2)
 
   **Commit**: NO (verification only, no new files)
 
-- [ ] 10. README with setup, build, install, and WireGuard configuration instructions
+- [x] 10. README with setup, build, install, and WireGuard configuration instructions
 
   **What to do**:
   - Create `README.md` at project root covering:
