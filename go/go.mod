@@ -4,9 +4,7 @@ go 1.25.0
 
 require (
 	github.com/bschaatsbergen/dnsdialer v0.0.0-20251225104348-3e7610e8ea45
-	github.com/cbeuw/connutil v1.0.1
 	github.com/google/uuid v1.6.0
-	github.com/pion/dtls/v3 v3.0.10
 	github.com/pion/logging v0.2.4
 	github.com/pion/turn/v5 v5.0.2
 )
@@ -14,6 +12,7 @@ require (
 require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/miekg/dns v1.1.69 // indirect
+	github.com/pion/dtls/v3 v3.0.10 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/stun/v3 v3.1.1 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect

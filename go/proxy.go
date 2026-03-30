@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,9 +12,6 @@ import (
 	"time"
 
 	"github.com/bschaatsbergen/dnsdialer"
-	"github.com/cbeuw/connutil"
-	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/logging"
 	"github.com/pion/turn/v5"
 )
@@ -30,7 +26,6 @@ type proxyConfig struct {
 	UDP      bool   `json:"udp"`
 	TurnHost string `json:"turnHost,omitempty"`
 	TurnPort string `json:"turnPort,omitempty"`
-	Direct   bool   `json:"direct,omitempty"`
 }
 
 type proxyInstance struct {
@@ -161,50 +156,15 @@ func (p *proxyInstance) run() {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
+	// Direct mode: each stream gets its own TURN allocation
+	// Local WireGuard traffic → TURN relay → remote WireGuard server
 	var workers sync.WaitGroup
-	if p.cfg.Direct {
-		for i := 0; i < p.cfg.Streams; i++ {
-			workers.Add(1)
-			go func() {
-				defer workers.Done()
-				oneTurnConnectionLoop(p.ctx, params, peer, listenConnChan, ticker.C)
-			}()
-		}
-	} else {
-		okchan := make(chan struct{}, 1)
-		connchan := make(chan net.PacketConn)
-
+	for i := 0; i < p.cfg.Streams; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			oneDTLSConnectionLoop(p.ctx, peer, listenConnChan, connchan, okchan, p.setError)
+			oneTurnConnectionLoop(p.ctx, params, peer, listenConnChan, ticker.C)
 		}()
-
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			oneTurnConnectionLoop(p.ctx, params, peer, connchan, ticker.C)
-		}()
-
-		select {
-		case <-okchan:
-		case <-p.ctx.Done():
-		}
-
-		for i := 0; i < p.cfg.Streams-1; i++ {
-			nextConnChan := make(chan net.PacketConn)
-			workers.Add(1)
-			go func(localConnChan chan net.PacketConn) {
-				defer workers.Done()
-				oneDTLSConnectionLoop(p.ctx, peer, listenConnChan, localConnChan, nil, p.setError)
-			}(nextConnChan)
-
-			workers.Add(1)
-			go func(localConnChan chan net.PacketConn) {
-				defer workers.Done()
-				oneTurnConnectionLoop(p.ctx, params, peer, localConnChan, ticker.C)
-			}(nextConnChan)
-		}
 	}
 
 	<-p.ctx.Done()
@@ -250,137 +210,6 @@ func normalizeVKLink(link string) string {
 		part = part[:idx]
 	}
 	return strings.TrimSpace(part)
-}
-
-func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.Conn, error) {
-	certificate, err := selfsign.GenerateSelfSigned()
-	if err != nil {
-		return nil, err
-	}
-	config := &dtls.Config{
-		Certificates:          []tls.Certificate{certificate},
-		InsecureSkipVerify:    true,
-		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
-		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
-		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
-	}
-
-	handshakeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	dtlsConn, err := dtls.Client(conn, peer, config)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := dtlsConn.HandshakeContext(handshakeCtx); err != nil {
-		return nil, err
-	}
-
-	return dtlsConn, nil
-}
-
-func oneDTLSConnection(
-	ctx context.Context,
-	peer *net.UDPAddr,
-	listenConn net.PacketConn,
-	connchan chan<- net.PacketConn,
-	okchan chan<- struct{},
-) error {
-	dtlsctx, dtlscancel := context.WithCancel(ctx)
-	defer dtlscancel()
-
-	conn1, conn2 := connutil.AsyncPacketPipe()
-
-	go func() {
-		for {
-			select {
-			case <-dtlsctx.Done():
-				return
-			case connchan <- conn2:
-			}
-		}
-	}()
-
-	dtlsConn, err := dtlsFunc(dtlsctx, conn1, peer)
-	if err != nil {
-		return fmt.Errorf("connect dtls: %w", err)
-	}
-	defer func() {
-		_ = dtlsConn.Close()
-	}()
-
-	go func() {
-		if okchan == nil {
-			return
-		}
-		for {
-			select {
-			case <-dtlsctx.Done():
-				return
-			case okchan <- struct{}{}:
-			}
-		}
-	}()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	context.AfterFunc(dtlsctx, func() {
-		_ = listenConn.SetDeadline(time.Now())
-		_ = dtlsConn.SetDeadline(time.Now())
-	})
-
-	var addr atomic.Value
-
-	go func() {
-		defer wg.Done()
-		defer dtlscancel()
-		buf := make([]byte, 1600)
-		for {
-			select {
-			case <-dtlsctx.Done():
-				return
-			default:
-			}
-			n, addr1, readErr := listenConn.ReadFrom(buf)
-			if readErr != nil {
-				return
-			}
-			addr.Store(addr1)
-			if _, writeErr := dtlsConn.Write(buf[:n]); writeErr != nil {
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer dtlscancel()
-		buf := make([]byte, 1600)
-		for {
-			select {
-			case <-dtlsctx.Done():
-				return
-			default:
-			}
-			n, readErr := dtlsConn.Read(buf)
-			if readErr != nil {
-				return
-			}
-			addr1, ok := addr.Load().(net.Addr)
-			if !ok {
-				continue
-			}
-			if _, writeErr := listenConn.WriteTo(buf[:n], addr1); writeErr != nil {
-				return
-			}
-		}
-	}()
-
-	wg.Wait()
-	_ = listenConn.SetDeadline(time.Time{})
-	_ = dtlsConn.SetDeadline(time.Time{})
-	return nil
 }
 
 func oneTurnConnection(ctx context.Context, params *turnParams, peer *net.UDPAddr, conn2 net.PacketConn) error {
@@ -524,26 +353,6 @@ func oneTurnConnection(ctx context.Context, params *turnParams, peer *net.UDPAdd
 	_ = relayConn.SetDeadline(time.Time{})
 	_ = conn2.SetDeadline(time.Time{})
 	return nil
-}
-
-func oneDTLSConnectionLoop(
-	ctx context.Context,
-	peer *net.UDPAddr,
-	listenConnChan <-chan net.PacketConn,
-	connchan chan<- net.PacketConn,
-	okchan chan<- struct{},
-	reportErr func(error),
-) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case listenConn := <-listenConnChan:
-			if err := oneDTLSConnection(ctx, peer, listenConn, connchan, okchan); err != nil && reportErr != nil {
-				reportErr(err)
-			}
-		}
-	}
 }
 
 func oneTurnConnectionLoop(

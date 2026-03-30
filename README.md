@@ -1,86 +1,72 @@
 # VK Turn Proxy for iOS
 
-An iOS port of [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy). This app allows you to tunnel WireGuard traffic through VK call TURN servers, which can help bypass certain network restrictions.
+An iOS port of [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy). Tunnels WireGuard traffic through VK call TURN servers to bypass network restrictions.
+
+## How It Works
+
+```
+WireGuard App (127.0.0.1:9000) → VK Turn Proxy → VK TURN Server → Your WireGuard Server
+```
+
+No extra servers or VPS needed. The app runs a local UDP proxy on your iPhone. You point the WireGuard iOS app at it, and your traffic is relayed through VK's TURN infrastructure directly to your remote WireGuard server.
 
 ## Download
 
 **[Download VKTurnProxy.ipa from Releases](https://github.com/kusha/ios-vpn-tun/releases/latest)**
 
-No need to build from source - grab the pre-built IPA and install via AltStore/Sideloadly.
+## Quick Start
 
-## Prerequisites
+1. **Install** the IPA via [AltStore](https://altstore.io/) or [Sideloadly](https://sideloadly.io/)
+2. **Open VK Turn Proxy** and enter:
+   - **VK Link** — a VK call join link (e.g. `https://vk.com/call/join/...`)
+   - **WireGuard Server** — your remote WireGuard server IP and port (e.g. `1.2.3.4:51820`)
+3. **Tap Connect**
+4. **Open the WireGuard app** (from the App Store) and configure a tunnel:
+   - Set **Endpoint** to `127.0.0.1:9000`
+   - Set **AllowedIPs** to `0.0.0.0/1, 128.0.0.0/1` (to avoid routing loops)
+5. **Activate** the WireGuard tunnel
 
-- iPhone or iPad running **iOS 18+**
-- macOS with **Xcode** installed (full Xcode.app, not just command line tools)
-- **Go 1.25+**
-- **XcodeGen** (`brew install xcodegen`)
-- **AltStore** or **Sideloadly** for installation
+Traffic now flows: WireGuard → local proxy → VK TURN → your WireGuard server.
 
-## Building the App
+## Building
 
-### Option A: GitHub CI (Recommended)
+### GitHub CI (Recommended)
 
-You can build the IPA without installing any local development tools by using GitHub Actions.
+Push code to GitHub — the **Build IPA** workflow runs automatically.
 
-1. Push your code to a GitHub repository.
-2. The **Build IPA** workflow will start automatically.
-3. Download the resulting `.ipa` from the **Actions** tab or the **Releases** page.
-4. To create a formal release:
-   ```bash
-   git tag v1.0.0
-   git push --tags
-   ```
+```bash
+# Create a release
+git tag v1.1.0
+git push --tags
+```
 
-### Option B: Local Build
+Download the IPA from the **Actions** tab → workflow artifacts.
 
-If you prefer to build locally on your Mac:
+### Local Build
 
-1. Clone the repository.
-2. Run the build script:
-   ```bash
-   ./build.sh
-   ```
-3. Find your app at `build/VKTurnProxy.ipa`.
+Requires macOS with Xcode.app, Go 1.25+, and XcodeGen.
+
+```bash
+./build.sh
+# Output: build/VKTurnProxy.ipa
+```
 
 ## Installing
 
-Since this app is not on the App Store, you must sideload it using a tool like AltStore or Sideloadly.
+Sideload the IPA using AltStore or Sideloadly:
 
-1. Install **AltStore** on your Mac.
-2. Connect your iPhone to your Mac via USB.
-3. Open AltStore, go to the "My Apps" tab, and tap the "+" icon.
-4. Select `VKTurnProxy.ipa` to install it.
-5. **Note:** If you use a free Apple ID, you must re-sign the app every **7 days** through AltStore.
+1. Connect iPhone to Mac via USB
+2. Open AltStore → My Apps → tap "+"
+3. Select `VKTurnProxy.ipa`
 
-## Using the App
-
-1. **Configure VK Turn:**
-   - Open the **VK Turn** app on your iPhone.
-   - Enter your VK call join link.
-   - Enter your peer address (the VPS running your [vk-turn-proxy server](https://github.com/cacggghp/vk-turn-proxy)).
-   - Tap **Connect**.
-
-2. **Configure WireGuard:**
-   - Open the official **WireGuard** app (from the App Store).
-   - Create or edit a tunnel configuration.
-   - Set the **Endpoint** to `127.0.0.1:9000`.
-   - **CRITICAL:** Update **AllowedIPs** to exclude localhost traffic to prevent loops:
-     ```
-     AllowedIPs = 0.0.0.0/1, 128.0.0.0/1
-     ```
-   - Save and activate the tunnel.
-
-3. **Keep-Alive:**
-   - The VK Turn app must stay in the foreground or remain in your recent apps list.
-   - While background audio helps keep the proxy alive, iOS may still kill the process if system resources are low.
+**Note:** Free Apple ID requires re-signing every 7 days.
 
 ## Limitations
 
-- **Process Persistence:** The proxy stops immediately if the app is killed.
-- **Sideloading:** Requires re-signing every 7 days with a free Apple ID.
-- **Service Support:** No support for Yandex Telemost.
-- **API Changes:** VK may change their internal API at any time, which could break the connection flow.
+- **Foreground only** — proxy stops when the app is killed
+- **7-day re-sign** — free Apple ID limitation via AltStore
+- **VK API dependent** — VK may change their internal API at any time
 
 ## Credits
 
-Based on the original [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy) project by cacggghp.
+Based on [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy) by cacggghp.

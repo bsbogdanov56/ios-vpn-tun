@@ -182,7 +182,7 @@ final class ProxyManager: ObservableObject {
     /// Create default configuration for testing
     static func defaultConfig() -> ProxyConfig {
         ProxyConfig(
-            peer: "1.2.3.4:56000",
+            peer: "1.2.3.4:51820",
             vkLink: "https://vk.com/call/join/XXXX",
             listen: "127.0.0.1:9000",
             streams: 16,

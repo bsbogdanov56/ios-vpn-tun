@@ -3,7 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var proxyManager = ProxyManager()
     @State private var vkLink: String = ""
-    @State private var peer: String = ""
+    @State private var wgServer: String = ""
     @State private var streams: Int = 16
     
     var body: some View {
@@ -13,7 +13,7 @@ struct ContentView: View {
                 .textInputAutocapitalization(.never)
                 .disableAutocorrection(true)
             
-            TextField("Peer Address (e.g. 1.2.3.4:56000)", text: $peer)
+            TextField("WireGuard Server (e.g. 1.2.3.4:51820)", text: $wgServer)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .textInputAutocapitalization(.never)
                 .disableAutocorrection(true)
@@ -57,7 +57,7 @@ struct ContentView: View {
             }
         } else {
             let config = ProxyConfig(
-                peer: peer,
+                peer: wgServer,
                 vkLink: vkLink,
                 listen: "127.0.0.1:9000",
                 streams: streams,
