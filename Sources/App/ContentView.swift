@@ -52,7 +52,9 @@ struct ContentView: View {
     
     private func toggleConnection() {
         if proxyManager.isRunning {
-            proxyManager.disconnect()
+            Task {
+                await proxyManager.disconnect()
+            }
         } else {
             let config = ProxyConfig(
                 peer: peer,
