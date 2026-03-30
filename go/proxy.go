@@ -183,6 +183,7 @@ func (p *proxyInstance) setError(err error) {
 	}
 	p.statusMu.Lock()
 	defer p.statusMu.Unlock()
+	p.state = "error"
 	p.lastError = err.Error()
 }
 

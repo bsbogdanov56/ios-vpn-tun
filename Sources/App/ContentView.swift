@@ -4,7 +4,6 @@ struct ContentView: View {
     @StateObject private var proxyManager = ProxyManager()
     @State private var vkLink: String = ""
     @State private var wgServer: String = ""
-    @State private var streams: Int = 16
     
     var body: some View {
         VStack(spacing: 16) {
@@ -17,8 +16,6 @@ struct ContentView: View {
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .textInputAutocapitalization(.never)
                 .disableAutocorrection(true)
-            
-            Stepper("Streams: \(streams)", value: $streams, in: 1...64)
             
             Button(action: toggleConnection) {
                 Text(proxyManager.isRunning ? "Disconnect" : "Connect")
@@ -60,7 +57,7 @@ struct ContentView: View {
                 peer: wgServer,
                 vkLink: vkLink,
                 listen: "127.0.0.1:9000",
-                streams: streams,
+                streams: 1,
                 udp: false
             )
             proxyManager.connect(config: config)

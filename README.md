@@ -8,7 +8,9 @@ An iOS port of [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy). Tunne
 WireGuard App (127.0.0.1:9000) → VK Turn Proxy → VK TURN Server → Your WireGuard Server
 ```
 
-No extra servers or VPS needed. The app runs a local UDP proxy on your iPhone. You point the WireGuard iOS app at it, and your traffic is relayed through VK's TURN infrastructure directly to your remote WireGuard server.
+The app runs a local UDP proxy on your iPhone. You point the WireGuard iOS app at it, and your traffic is relayed through VK's TURN infrastructure to your remote WireGuard server.
+
+> **⚠️ Important:** VK's TURN servers are designed for VK calls. They may restrict relaying to only call participants and block traffic to arbitrary endpoints. If this happens, the proxy will fail to forward traffic. In that case, you will need to run a second [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy) instance on your server that also joins the same VK call — see the original project for server-side setup.
 
 ## Download
 
@@ -63,6 +65,7 @@ Sideload the IPA using AltStore or Sideloadly:
 
 ## Limitations
 
+- **VK TURN restrictions** — VK may only relay between call participants, not to arbitrary IPs. If direct mode doesn't work, you'll need a server-side proxy (see note above).
 - **Foreground only** — proxy stops when the app is killed
 - **7-day re-sign** — free Apple ID limitation via AltStore
 - **VK API dependent** — VK may change their internal API at any time

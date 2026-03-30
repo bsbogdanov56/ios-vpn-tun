@@ -185,7 +185,7 @@ final class ProxyManager: ObservableObject {
             peer: "1.2.3.4:51820",
             vkLink: "https://vk.com/call/join/XXXX",
             listen: "127.0.0.1:9000",
-            streams: 16,
+            streams: 1,
             udp: false
         )
     }
