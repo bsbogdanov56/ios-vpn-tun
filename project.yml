@@ -27,13 +27,13 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge/VKTurnProxy-Bridging-Header.h
         HEADER_SEARCH_PATHS: $(PROJECT_DIR)/build/go
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/build/go
+        OTHER_LDFLAGS: -lvkturn
         VALID_ARCHS: arm64
         ARCHS: arm64
         CODE_SIGN_STYLE: Automatic
     dependencies:
       - sdk: libresolv.tbd
       - sdk: Security.framework
-      - path: build/go/libvkturn.a
     info:
       path: Info.plist
     entitlements:
