@@ -32,6 +32,10 @@ struct ContentView: View {
                 .font(.headline)
 
             ZStack(alignment: .topTrailing) {
+                // Background fills the full rectangle regardless of content.
+                Color.gray.opacity(0.1)
+                    .cornerRadius(8)
+
                 ScrollView {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(proxyManager.logMessages) { log in
@@ -41,10 +45,9 @@ struct ContentView: View {
                                 .textSelection(.enabled)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(8)
                 }
-                .background(Color.gray.opacity(0.1))
-                .cornerRadius(8)
 
                 Button {
                     let text = proxyManager.logMessages
@@ -163,9 +166,10 @@ private struct WebViewRepresentable: UIViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
-        // Desktop Chrome UA — VK's call web client only renders the "Join"
-        // interface in desktop mode. On mobile UA VK redirects to /feed.
-        webView.customUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+        // macOS Safari UA — WKWebView is actually WebKit (Safari engine), so
+        // declaring Chrome causes VK's feature-detection to say "outdated browser".
+        // Mac Safari = desktop interface + honest engine match.
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
 
         context.coordinator.targetURL = url
         context.coordinator.webView = webView
