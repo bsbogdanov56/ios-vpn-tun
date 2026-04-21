@@ -478,18 +478,23 @@ func oneTurnConnectionLoop(
 	connchan <-chan net.PacketConn,
 	ticks <-chan time.Time,
 ) {
-	for {
+	// Previously this looped and retried TURN connections on failure.
+	// On iOS that creates a routing loop once WireGuard is up: every retry's
+	// dial to the TURN server gets captured by WG and fed back through our
+	// local proxy, infinite-looping until timeout.
+	//
+	// New behavior: one TURN session per Connect. If it dies, report the error
+	// and let the user reconnect manually (with WireGuard off).
+	select {
+	case <-ctx.Done():
+		return
+	case conn2 := <-connchan:
 		select {
 		case <-ctx.Done():
 			return
-		case conn2 := <-connchan:
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticks:
-				if err := oneTurnConnection(ctx, params, peer, conn2); err != nil && params.reportErr != nil {
-					params.reportErr(err)
-				}
+		case <-ticks:
+			if err := oneTurnConnection(ctx, params, peer, conn2); err != nil && params.reportErr != nil {
+				params.reportErr(err)
 			}
 		}
 	}
