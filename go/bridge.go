@@ -74,6 +74,30 @@ func VKTurnGetStatus(handle int32) *C.char {
 	return C.CString(instance.statusJSON())
 }
 
+// VKTurnSubmitCaptcha delivers a user-entered captcha answer to the proxy
+// instance that's currently waiting on one. Returns 0 on success, -1 otherwise.
+//
+//export VKTurnSubmitCaptcha
+func VKTurnSubmitCaptcha(handle int32, answer *C.char) int32 {
+	if answer == nil {
+		return -1
+	}
+	ans := C.GoString(answer)
+
+	proxyHandlesMu.Lock()
+	instance, ok := proxyHandles[handle]
+	proxyHandlesMu.Unlock()
+
+	if !ok {
+		return -1
+	}
+
+	if instance.submitCaptcha(ans) {
+		return 0
+	}
+	return -1
+}
+
 //export VKTurnFreeString
 func VKTurnFreeString(s *C.char) {
 	if s != nil {

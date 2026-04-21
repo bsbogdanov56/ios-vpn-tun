@@ -12,26 +12,29 @@ struct LogEntry: Identifiable, Hashable {
 /// Manages proxy connection state and status polling
 @MainActor
 final class ProxyManager: ObservableObject {
-    
+
     // MARK: - Published State
-    
+
     @Published private(set) var isRunning = false
     @Published private(set) var statusText = "Disconnected"
     @Published private(set) var logMessages: [LogEntry] = []
-    
+    @Published var captchaImgURL: String? = nil
+    @Published private(set) var captchaSid: String? = nil
+
     // MARK: - Private State
-    
+
     private var proxyHandle: Int32 = -1
     private var statusTimer: Timer?
     private let statusQueue = DispatchQueue(label: "com.vkturn.statusQueue", qos: .utility)
     private let maxLogEntries = 100
-    
+    private var lastCaptchaSid: String? = nil
+
     // MARK: - Configuration
-    
+
     private var currentConfig: ProxyConfig?
-    
+
     // MARK: - Lifecycle
-    
+
     deinit {
         Task { @MainActor in
             if self.isRunning {
@@ -39,9 +42,9 @@ final class ProxyManager: ObservableObject {
             }
         }
     }
-    
+
     // MARK: - Public API
-    
+
     /// Connect to VK TURN server with given configuration
     /// - Parameter config: Proxy configuration
     func connect(config: ProxyConfig) {
@@ -49,18 +52,18 @@ final class ProxyManager: ObservableObject {
             addLog("Already connected")
             return
         }
-        
+
         currentConfig = config
         addLog("Starting proxy connection...")
         statusText = "Connecting..."
-        
+
         // Start proxy on background queue
         Task.detached { [weak self] in
             let handle = VKTurnBridge.startProxy(config: config)
-            
+
             await MainActor.run {
                 guard let self = self else { return }
-                
+
                 if handle >= 0 {
                     self.proxyHandle = handle
                     self.isRunning = true
@@ -73,7 +76,7 @@ final class ProxyManager: ObservableObject {
             }
         }
     }
-    
+
     /// Disconnect from VK TURN server
     @MainActor
     func disconnect() async {
@@ -81,31 +84,53 @@ final class ProxyManager: ObservableObject {
             addLog("Not connected")
             return
         }
-        
+
         stopStatusPolling()
-        
+
         let handle = proxyHandle
         addLog("Stopping proxy with handle \(handle)...")
-        
+
         // Stop proxy on background queue
         Task.detached { [weak self] in
             VKTurnBridge.stopProxy(handle: handle)
-            
+
             await MainActor.run {
                 guard let self = self else { return }
                 self.proxyHandle = -1
                 self.isRunning = false
                 self.statusText = "Disconnected"
+                self.captchaImgURL = nil
+                self.captchaSid = nil
+                self.lastCaptchaSid = nil
                 self.addLog("Proxy stopped")
             }
         }
     }
-    
+
+    /// Submit a user-entered captcha answer to the Go proxy.
+    func submitCaptchaAnswer(_ answer: String) {
+        let handle = proxyHandle
+        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        addLog("Submitting captcha: \(trimmed)")
+        Task.detached {
+            let ok = VKTurnBridge.submitCaptcha(handle: handle, answer: trimmed)
+            await MainActor.run { [weak self] in
+                guard let self = self else { return }
+                if !ok {
+                    self.addLog("Submit captcha: no captcha awaited (maybe already stopped)")
+                }
+            }
+        }
+        // Hide UI immediately; Go will re-surface another captcha if the answer is wrong.
+        captchaImgURL = nil
+        captchaSid = nil
+    }
+
     // MARK: - Status Polling
-    
+
     private func startStatusPolling() {
         stopStatusPolling()
-        
+
         // Poll status every second
         statusTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -113,35 +138,48 @@ final class ProxyManager: ObservableObject {
                 await self.pollStatus()
             }
         }
-        
+
         // Initial poll
         Task {
             await pollStatus()
         }
     }
-    
+
     private func stopStatusPolling() {
         statusTimer?.invalidate()
         statusTimer = nil
     }
-    
+
     private func pollStatus() async {
         let handle = proxyHandle
-        
+
         // Query status on background queue
         let status: ProxyStatus? = await Task.detached {
             return VKTurnBridge.getStatus(handle: handle)
         }.value
-        
+
         guard let status = status else {
             statusText = "Status Unknown"
             return
         }
-        
+
         // Update UI on main thread
         switch status.state {
         case "running":
             statusText = "Running"
+            if captchaImgURL != nil {
+                captchaImgURL = nil
+                captchaSid = nil
+            }
+        case "captcha_needed":
+            statusText = "Captcha Required"
+            let newSid = status.captchaSid
+            if newSid != lastCaptchaSid {
+                addLog("Captcha required (sid=\(newSid ?? "?"))")
+                lastCaptchaSid = newSid
+            }
+            captchaImgURL = status.captchaImg
+            captchaSid = newSid
         case "stopped":
             statusText = "Stopped"
             if isRunning {
@@ -164,21 +202,21 @@ final class ProxyManager: ObservableObject {
             statusText = "Unknown State: \(status.state)"
         }
     }
-    
+
     // MARK: - Logging
-    
+
     private func addLog(_ message: String) {
         let entry = LogEntry(timestamp: Date(), message: message)
         logMessages.append(entry)
-        
+
         // Limit log entries to prevent unbounded growth
         if logMessages.count > maxLogEntries {
             logMessages.removeFirst(logMessages.count - maxLogEntries)
         }
     }
-    
+
     // MARK: - Convenience
-    
+
     /// Create default configuration for testing
     static func defaultConfig() -> ProxyConfig {
         ProxyConfig(

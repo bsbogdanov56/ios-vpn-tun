@@ -37,6 +37,12 @@ type proxyInstance struct {
 	statusMu  sync.RWMutex
 	state     string
 	lastError string
+
+	// Captcha coordination
+	captchaMu       sync.Mutex
+	captchaImg      string
+	captchaSid      string
+	captchaAnswerCh chan string
 }
 
 type turnParams struct {
@@ -120,7 +126,7 @@ func (p *proxyInstance) run() {
 		udp:       p.cfg.UDP,
 		reportErr: p.setError,
 		getCreds: func(s string) (string, string, string, error) {
-			return getVKCreds(s, dialer)
+			return getVKCreds(s, dialer, p.requestCaptcha)
 		},
 	}
 
@@ -156,8 +162,6 @@ func (p *proxyInstance) run() {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
-	// Direct mode: each stream gets its own TURN allocation
-	// Local WireGuard traffic → TURN relay → remote WireGuard server
 	var workers sync.WaitGroup
 	for i := 0; i < p.cfg.Streams; i++ {
 		workers.Add(1)
@@ -187,12 +191,79 @@ func (p *proxyInstance) setError(err error) {
 	p.lastError = err.Error()
 }
 
+// requestCaptcha is called from getVKCreds when VK demands captcha solving.
+// Publishes the image URL + sid into status; blocks until Swift calls
+// submitCaptcha or context is cancelled or 5 minutes pass.
+func (p *proxyInstance) requestCaptcha(sid, imgURL string) (string, error) {
+	ch := make(chan string, 1)
+
+	p.captchaMu.Lock()
+	p.captchaImg = imgURL
+	p.captchaSid = sid
+	p.captchaAnswerCh = ch
+	p.captchaMu.Unlock()
+
+	p.setState("captcha_needed")
+
+	defer func() {
+		p.captchaMu.Lock()
+		p.captchaImg = ""
+		p.captchaSid = ""
+		p.captchaAnswerCh = nil
+		p.captchaMu.Unlock()
+		// restore state back to running if we were running (best effort)
+		p.statusMu.Lock()
+		if p.state == "captcha_needed" {
+			p.state = "running"
+		}
+		p.statusMu.Unlock()
+	}()
+
+	select {
+	case answer := <-ch:
+		return answer, nil
+	case <-p.ctx.Done():
+		return "", fmt.Errorf("context cancelled during captcha wait")
+	case <-time.After(5 * time.Minute):
+		return "", fmt.Errorf("captcha timeout (5 min)")
+	}
+}
+
+// submitCaptcha is called from the C bridge when the user submits a captcha answer.
+// Returns true if delivered, false if no captcha was currently awaited.
+func (p *proxyInstance) submitCaptcha(answer string) bool {
+	p.captchaMu.Lock()
+	ch := p.captchaAnswerCh
+	p.captchaMu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- answer:
+		return true
+	default:
+		return false
+	}
+}
+
 func (p *proxyInstance) statusJSON() string {
 	p.statusMu.RLock()
-	defer p.statusMu.RUnlock()
+	state := p.state
+	lastError := p.lastError
+	p.statusMu.RUnlock()
+
+	p.captchaMu.Lock()
+	img := p.captchaImg
+	sid := p.captchaSid
+	p.captchaMu.Unlock()
+
 	status := map[string]any{
-		"state": p.state,
-		"error": p.lastError,
+		"state": state,
+		"error": lastError,
+	}
+	if state == "captcha_needed" && img != "" {
+		status["captcha_img"] = img
+		status["captcha_sid"] = sid
 	}
 	b, err := json.Marshal(status)
 	if err != nil {
