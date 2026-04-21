@@ -1,5 +1,5 @@
 import SwiftUI
-import WebKit
+import UIKit
 
 struct ContentView: View {
     @StateObject private var proxyManager = ProxyManager()
@@ -32,7 +32,6 @@ struct ContentView: View {
                 .font(.headline)
 
             ZStack(alignment: .topTrailing) {
-                // Background fills the full rectangle regardless of content.
                 Color.gray.opacity(0.1)
                     .cornerRadius(8)
 
@@ -67,21 +66,18 @@ struct ContentView: View {
         }
         .padding()
         .sheet(isPresented: Binding(
-            get: { proxyManager.webViewURL != nil },
+            get: { proxyManager.captchaImgURL != nil },
             set: { newValue in
                 if !newValue {
-                    proxyManager.cancelWebView()
+                    proxyManager.captchaImgURL = nil
                 }
             }
         )) {
-            if let url = proxyManager.webViewURL {
-                VKCallWebView(
-                    url: url,
-                    onCredsReceived: { user, pass, urls in
-                        proxyManager.submitTurnCreds(user: user, credential: pass, urls: urls)
-                    },
-                    onCancel: {
-                        proxyManager.cancelWebView()
+            if let imgURL = proxyManager.captchaImgURL {
+                CaptchaView(
+                    imgURL: imgURL,
+                    onSubmit: { answer in
+                        proxyManager.submitCaptchaAnswer(answer)
                     }
                 )
             }
@@ -89,7 +85,7 @@ struct ContentView: View {
     }
 
     private func toggleConnection() {
-        if proxyManager.isRunning || proxyManager.webViewURL != nil {
+        if proxyManager.isRunning {
             Task {
                 await proxyManager.disconnect()
             }
@@ -106,233 +102,106 @@ struct ContentView: View {
     }
 }
 
-// MARK: - VK Call WebView
-
-/// SwiftUI wrapper around WKWebView that loads the VK call page and
-/// intercepts TURN credentials as soon as VK hands them to the web client
-/// (either via RTCPeerConnection or via XHR/fetch to calls.okcdn.ru).
-struct VKCallWebView: View {
-    let url: URL
-    let onCredsReceived: (String, String, [String]) -> Void
-    let onCancel: () -> Void
-
-    @State private var progress: Double = 0
+struct CaptchaView: View {
+    let imgURL: String
+    let onSubmit: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var answer: String = ""
 
     var body: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                if progress > 0 && progress < 1 {
-                    ProgressView(value: progress).padding(.horizontal)
-                }
-                WebViewRepresentable(
-                    url: url,
-                    onCredsReceived: onCredsReceived,
-                    progress: $progress
-                )
-            }
-            .navigationBarTitle("Решите капчу VK", displayMode: .inline)
-            .navigationBarItems(
-                leading: Button("Отмена", action: onCancel)
+        VStack(spacing: 20) {
+            Text("Введите капчу")
+                .font(.title2)
+                .bold()
+                .padding(.top, 24)
+
+            Text("VK требует подтвердить, что ты не бот.")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+
+            captchaImageView
+
+            TextField("Ответ", text: $answer)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+                .textInputAutocapitalization(.never)
+                .disableAutocorrection(true)
+                .font(.title3)
+
+            HStack(spacing: 12) {
+                Button("Отмена") { dismiss() }
                     .foregroundColor(.red)
-            )
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color.gray.opacity(0.15))
+                    .cornerRadius(8)
+
+                Button("Отправить") {
+                    onSubmit(answer)
+                    dismiss()
+                }
+                .foregroundColor(.green)
+                .padding()
+                .frame(maxWidth: .infinity)
+                .background(Color.gray.opacity(0.15))
+                .cornerRadius(8)
+                .disabled(answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            Spacer()
         }
-    }
-}
-
-private struct WebViewRepresentable: UIViewRepresentable {
-    let url: URL
-    let onCredsReceived: (String, String, [String]) -> Void
-    @Binding var progress: Double
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onCredsReceived: onCredsReceived, progressBinding: $progress)
-    }
-
-    func makeUIView(context: Context) -> WKWebView {
-        let contentController = WKUserContentController()
-        contentController.add(context.coordinator, name: "turnCreds")
-
-        let hookScript = Self.hookScript()
-        contentController.addUserScript(
-            WKUserScript(source: hookScript, injectionTime: .atDocumentStart, forMainFrameOnly: false)
-        )
-
-        let config = WKWebViewConfiguration()
-        config.userContentController = contentController
-        config.websiteDataStore = .nonPersistent()
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = context.coordinator
-        webView.allowsBackForwardNavigationGestures = true
-        // macOS Safari UA — WKWebView is actually WebKit (Safari engine), so
-        // declaring Chrome causes VK's feature-detection to say "outdated browser".
-        // Mac Safari = desktop interface + honest engine match.
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
-
-        context.coordinator.targetURL = url
-        context.coordinator.webView = webView
-
-        webView.load(URLRequest(url: url))
-
-        // KVO for progress
-        context.coordinator.observe(webView: webView)
-
-        return webView
+        .padding()
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
-
-    static func hookScript() -> String {
-        return """
-        (function() {
-            var captured = false;
-            function emit(username, credential, urls) {
-                if (captured) return;
-                if (!username || !credential) return;
-                if (!urls || (Array.isArray(urls) && urls.length === 0)) return;
-                if (typeof urls === 'string') urls = [urls];
-                captured = true;
-                try {
-                    window.webkit.messageHandlers.turnCreds.postMessage({
-                        username: String(username),
-                        credential: String(credential),
-                        urls: urls.map(String)
-                    });
-                } catch (e) {}
+    @ViewBuilder
+    private var captchaImageView: some View {
+        if imgURL.hasPrefix("data:") {
+            if let uiImage = decodeDataURLImage(imgURL) {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxHeight: 140)
+                    .background(Color.white)
+                    .cornerRadius(6)
+            } else {
+                errorImagePlaceholder
             }
-
-            function scanIceServers(cfg) {
-                if (!cfg || !cfg.iceServers) return;
-                for (var i = 0; i < cfg.iceServers.length; i++) {
-                    var srv = cfg.iceServers[i];
-                    if (!srv) continue;
-                    if (srv.username && srv.credential) {
-                        var urls = srv.urls || (srv.url ? [srv.url] : []);
-                        emit(srv.username, srv.credential, urls);
-                        return;
-                    }
+        } else {
+            AsyncImage(url: URL(string: imgURL)) { phase in
+                switch phase {
+                case .empty:
+                    ProgressView().frame(height: 80)
+                case .success(let image):
+                    image
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxHeight: 140)
+                        .background(Color.white)
+                        .cornerRadius(6)
+                case .failure:
+                    errorImagePlaceholder
+                @unknown default:
+                    ProgressView()
                 }
             }
-
-            var origRTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
-            if (origRTC) {
-                var Wrapped = function(cfg) {
-                    scanIceServers(cfg);
-                    return new origRTC(cfg);
-                };
-                Wrapped.prototype = origRTC.prototype;
-                window.RTCPeerConnection = Wrapped;
-                if (window.webkitRTCPeerConnection) { window.webkitRTCPeerConnection = Wrapped; }
-            }
-
-            function inspectBody(body) {
-                if (!body || typeof body !== 'object') return;
-                if (body.turn_server && body.turn_server.username) {
-                    var ts = body.turn_server;
-                    var urls = ts.urls || (ts.url ? [ts.url] : []);
-                    emit(ts.username, ts.credential, urls);
-                }
-                if (body.response) inspectBody(body.response);
-                if (Array.isArray(body.ice_servers)) {
-                    scanIceServers({iceServers: body.ice_servers});
-                }
-            }
-
-            var origFetch = window.fetch;
-            if (origFetch) {
-                window.fetch = function() {
-                    var p = origFetch.apply(this, arguments);
-                    try {
-                        p.then(function(resp) {
-                            return resp.clone().text();
-                        }).then(function(text) {
-                            try {
-                                var data = JSON.parse(text);
-                                inspectBody(data);
-                            } catch (e) {}
-                        }).catch(function() {});
-                    } catch (e) {}
-                    return p;
-                };
-            }
-
-            var origOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function() {
-                this._vkHookUrl = arguments[1] || '';
-                return origOpen.apply(this, arguments);
-            };
-            var origSend = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.send = function() {
-                var xhr = this;
-                xhr.addEventListener('load', function() {
-                    try {
-                        var ct = xhr.getResponseHeader && xhr.getResponseHeader('content-type') || '';
-                        if (ct.indexOf('json') === -1 && ct.indexOf('javascript') === -1) return;
-                        var data = JSON.parse(xhr.responseText);
-                        inspectBody(data);
-                    } catch (e) {}
-                });
-                return origSend.apply(this, arguments);
-            };
-        })();
-        """
+        }
     }
 
-    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
-        let onCredsReceived: (String, String, [String]) -> Void
-        private let progressBinding: Binding<Double>
-        private var observation: NSKeyValueObservation?
-        weak var webView: WKWebView?
-        var targetURL: URL?
-        private var redirectAttempts = 0
-
-        init(onCredsReceived: @escaping (String, String, [String]) -> Void, progressBinding: Binding<Double>) {
-            self.onCredsReceived = onCredsReceived
-            self.progressBinding = progressBinding
+    private var errorImagePlaceholder: some View {
+        VStack {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.largeTitle)
+                .foregroundColor(.orange)
+            Text("Не удалось загрузить картинку")
+                .font(.footnote)
         }
+        .frame(height: 100)
+    }
 
-        func observe(webView: WKWebView) {
-            observation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
-                DispatchQueue.main.async {
-                    self?.progressBinding.wrappedValue = webView.estimatedProgress
-                }
-            }
-        }
-
-        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard message.name == "turnCreds" else { return }
-            guard let dict = message.body as? [String: Any],
-                  let username = dict["username"] as? String,
-                  let credential = dict["credential"] as? String,
-                  let urls = dict["urls"] as? [String] else {
-                return
-            }
-            onCredsReceived(username, credential, urls)
-        }
-
-        // If after navigating we end up somewhere other than the call join page
-        // (e.g., VK redirected to /feed after login), push back to the original
-        // call URL. Retry at most twice to avoid infinite loops.
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            guard let current = webView.url, let target = targetURL else { return }
-
-            let currentPath = current.path
-            let targetPath = target.path
-
-            // Bail out if we're on the right page (call join) or already on captcha page.
-            if currentPath.contains("/call/join/") || currentPath.contains("captcha") || currentPath.contains("not_robot") {
-                return
-            }
-
-            // If VK bounced us to something else (feed, profile, etc.), redirect back.
-            if redirectAttempts < 2 && currentPath != targetPath {
-                redirectAttempts += 1
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak webView] in
-                    webView?.load(URLRequest(url: target))
-                }
-            }
-        }
+    private func decodeDataURLImage(_ url: String) -> UIImage? {
+        guard let commaIdx = url.firstIndex(of: ",") else { return nil }
+        let base64Part = String(url[url.index(after: commaIdx)...])
+        guard let data = Data(base64Encoded: base64Part) else { return nil }
+        return UIImage(data: data)
     }
 }

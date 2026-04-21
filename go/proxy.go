@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bschaatsbergen/dnsdialer"
 	"github.com/pion/logging"
 	"github.com/pion/turn/v5"
 )
@@ -27,13 +28,6 @@ type proxyConfig struct {
 	TurnPort string `json:"turnPort,omitempty"`
 }
 
-// turnCreds are fetched by the Swift-side WebView and submitted into the proxy.
-type turnCreds struct {
-	Username string
-	Password string
-	Server   string // host:port, no scheme
-}
-
 type proxyInstance struct {
 	handle    int32
 	cfg       proxyConfig
@@ -44,10 +38,11 @@ type proxyInstance struct {
 	state     string
 	lastError string
 
-	// Cred exchange with Swift
-	credsMu sync.Mutex
-	creds   *turnCreds
-	credsCh chan struct{} // closed once creds are submitted
+	// Captcha coordination with Swift side
+	captchaMu       sync.Mutex
+	captchaImg      string
+	captchaSid      string
+	captchaAnswerCh chan string
 }
 
 type turnParams struct {
@@ -80,19 +75,17 @@ func newProxyInstance(cfg proxyConfig) (*proxyInstance, error) {
 	if cfg.Streams <= 0 {
 		cfg.Streams = 16
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	return &proxyInstance{
-		cfg:     cfg,
-		ctx:     ctx,
-		cancel:  cancel,
-		state:   "created",
-		credsCh: make(chan struct{}),
+		cfg:    cfg,
+		ctx:    ctx,
+		cancel: cancel,
+		state:  "created",
 	}, nil
 }
 
 func (p *proxyInstance) start() {
-	p.setState("waiting_creds")
+	p.setState("starting")
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -106,32 +99,54 @@ func (p *proxyInstance) stop() {
 	p.setState("stopped")
 }
 
-// submitTurnCreds is called from the C bridge when Swift's WebView hooks fire.
-// Returns true on first submission, false on subsequent ones.
-func (p *proxyInstance) submitTurnCreds(user, pass, server string) bool {
-	p.credsMu.Lock()
-	defer p.credsMu.Unlock()
-	if p.creds != nil {
-		return false
+// requestCaptcha: called from getVKCreds. Publishes image+sid, blocks until
+// Swift submits an answer via VKTurnSubmitCaptcha, or ctx cancelled / 5min timeout.
+func (p *proxyInstance) requestCaptcha(sid, imgURL string) (string, error) {
+	ch := make(chan string, 1)
+
+	p.captchaMu.Lock()
+	p.captchaImg = imgURL
+	p.captchaSid = sid
+	p.captchaAnswerCh = ch
+	p.captchaMu.Unlock()
+
+	p.setState("captcha_needed")
+
+	defer func() {
+		p.captchaMu.Lock()
+		p.captchaImg = ""
+		p.captchaSid = ""
+		p.captchaAnswerCh = nil
+		p.captchaMu.Unlock()
+		p.statusMu.Lock()
+		if p.state == "captcha_needed" {
+			p.state = "running"
+		}
+		p.statusMu.Unlock()
+	}()
+
+	select {
+	case answer := <-ch:
+		return answer, nil
+	case <-p.ctx.Done():
+		return "", fmt.Errorf("context cancelled")
+	case <-time.After(5 * time.Minute):
+		return "", fmt.Errorf("captcha timeout")
 	}
-	p.creds = &turnCreds{Username: user, Password: pass, Server: server}
-	close(p.credsCh) // signal all waiters
-	return true
 }
 
-// waitForCreds blocks until creds are submitted or the proxy is cancelled.
-func (p *proxyInstance) waitForCreds() (string, string, string, error) {
+func (p *proxyInstance) submitCaptcha(answer string) bool {
+	p.captchaMu.Lock()
+	ch := p.captchaAnswerCh
+	p.captchaMu.Unlock()
+	if ch == nil {
+		return false
+	}
 	select {
-	case <-p.credsCh:
-		p.credsMu.Lock()
-		c := p.creds
-		p.credsMu.Unlock()
-		if c == nil {
-			return "", "", "", errors.New("creds nil after channel close")
-		}
-		return c.Username, c.Password, c.Server, nil
-	case <-p.ctx.Done():
-		return "", "", "", p.ctx.Err()
+	case ch <- answer:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -141,21 +156,24 @@ func (p *proxyInstance) run() {
 		p.setError(fmt.Errorf("resolve peer: %w", err))
 		return
 	}
-
 	link := normalizeVKLink(p.cfg.VKLink)
 	if link == "" {
 		p.setError(errors.New("invalid vkLink"))
 		return
 	}
-
+	dialer := dnsdialer.New(
+		dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53"),
+		dnsdialer.WithStrategy(dnsdialer.Fallback{}),
+		dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
+	)
 	params := &turnParams{
 		host:      p.cfg.TurnHost,
 		port:      p.cfg.TurnPort,
 		link:      link,
 		udp:       p.cfg.UDP,
 		reportErr: p.setError,
-		getCreds: func(_ string) (string, string, string, error) {
-			return p.waitForCreds()
+		getCreds: func(s string) (string, string, string, error) {
+			return getVKCreds(s, dialer, p.requestCaptcha)
 		},
 	}
 
@@ -164,9 +182,7 @@ func (p *proxyInstance) run() {
 		p.setError(fmt.Errorf("listen: %w", err))
 		return
 	}
-	defer func() {
-		_ = listenConn.Close()
-	}()
+	defer func() { _ = listenConn.Close() }()
 
 	go func() {
 		<-p.ctx.Done()
@@ -199,7 +215,6 @@ func (p *proxyInstance) run() {
 			oneTurnConnectionLoop(p.ctx, params, peer, listenConnChan, ticker.C)
 		}()
 	}
-
 	<-p.ctx.Done()
 	workers.Wait()
 }
@@ -222,15 +237,23 @@ func (p *proxyInstance) setError(err error) {
 
 func (p *proxyInstance) statusJSON() string {
 	p.statusMu.RLock()
-	status := map[string]any{
-		"state": p.state,
-		"error": p.lastError,
-	}
+	state := p.state
+	lastError := p.lastError
 	p.statusMu.RUnlock()
 
+	p.captchaMu.Lock()
+	img := p.captchaImg
+	sid := p.captchaSid
+	p.captchaMu.Unlock()
+
+	status := map[string]any{"state": state, "error": lastError}
+	if state == "captcha_needed" && img != "" {
+		status["captcha_img"] = img
+		status["captcha_sid"] = sid
+	}
 	b, err := json.Marshal(status)
 	if err != nil {
-		return `{"state":"error","error":"marshal status failed"}`
+		return `{"state":"error","error":"marshal failed"}`
 	}
 	return string(b)
 }
@@ -280,18 +303,14 @@ func oneTurnConnection(ctx context.Context, params *turnParams, peer *net.UDPAdd
 		if dialErr != nil {
 			return fmt.Errorf("connect turn server udp: %w", dialErr)
 		}
-		defer func() {
-			_ = conn.Close()
-		}()
+		defer func() { _ = conn.Close() }()
 		turnConn = &connectedUDPConn{conn}
 	} else {
 		conn, dialErr := (&net.Dialer{}).DialContext(dialCtx, "tcp", turnServerAddr)
 		if dialErr != nil {
 			return fmt.Errorf("connect turn server tcp: %w", dialErr)
 		}
-		defer func() {
-			_ = conn.Close()
-		}()
+		defer func() { _ = conn.Close() }()
 		turnConn = turn.NewSTUNConn(conn)
 	}
 
@@ -322,9 +341,7 @@ func oneTurnConnection(ctx context.Context, params *turnParams, peer *net.UDPAdd
 	if err != nil {
 		return fmt.Errorf("turn allocate: %w", err)
 	}
-	defer func() {
-		_ = relayConn.Close()
-	}()
+	defer func() { _ = relayConn.Close() }()
 
 	turnCtx, turnCancel := context.WithCancel(ctx)
 	defer turnCancel()
