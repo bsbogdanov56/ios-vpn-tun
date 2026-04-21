@@ -156,8 +156,6 @@ private struct WebViewRepresentable: UIViewRepresentable {
 
         let config = WKWebViewConfiguration()
         config.userContentController = contentController
-        // Fresh data store — no carried-over cookies/localStorage from previous attempts.
-        // VK's "bot reputation" resets with each WebView session.
         config.websiteDataStore = .nonPersistent()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
@@ -165,7 +163,12 @@ private struct WebViewRepresentable: UIViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
-        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+        // Desktop Chrome UA — VK's call web client only renders the "Join"
+        // interface in desktop mode. On mobile UA VK redirects to /feed.
+        webView.customUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+
+        context.coordinator.targetURL = url
+        context.coordinator.webView = webView
 
         webView.load(URLRequest(url: url))
 
@@ -277,6 +280,9 @@ private struct WebViewRepresentable: UIViewRepresentable {
         let onCredsReceived: (String, String, [String]) -> Void
         private let progressBinding: Binding<Double>
         private var observation: NSKeyValueObservation?
+        weak var webView: WKWebView?
+        var targetURL: URL?
+        private var redirectAttempts = 0
 
         init(onCredsReceived: @escaping (String, String, [String]) -> Void, progressBinding: Binding<Double>) {
             self.onCredsReceived = onCredsReceived
@@ -300,6 +306,29 @@ private struct WebViewRepresentable: UIViewRepresentable {
                 return
             }
             onCredsReceived(username, credential, urls)
+        }
+
+        // If after navigating we end up somewhere other than the call join page
+        // (e.g., VK redirected to /feed after login), push back to the original
+        // call URL. Retry at most twice to avoid infinite loops.
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard let current = webView.url, let target = targetURL else { return }
+
+            let currentPath = current.path
+            let targetPath = target.path
+
+            // Bail out if we're on the right page (call join) or already on captcha page.
+            if currentPath.contains("/call/join/") || currentPath.contains("captcha") || currentPath.contains("not_robot") {
+                return
+            }
+
+            // If VK bounced us to something else (feed, profile, etc.), redirect back.
+            if redirectAttempts < 2 && currentPath != targetPath {
+                redirectAttempts += 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak webView] in
+                    webView?.load(URLRequest(url: target))
+                }
+            }
         }
     }
 }
