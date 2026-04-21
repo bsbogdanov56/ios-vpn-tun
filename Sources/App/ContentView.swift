@@ -30,19 +30,36 @@ struct ContentView: View {
             Text(proxyManager.statusText)
                 .font(.headline)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(proxyManager.logMessages) { log in
-                        Text("\(log.timestamp.formatted(date: .omitted, time: .standard)) - \(log.message)")
-                            .font(.system(.caption, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
+            ZStack(alignment: .topTrailing) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(proxyManager.logMessages) { log in
+                            Text("\(log.timestamp.formatted(date: .omitted, time: .standard)) - \(log.message)")
+                                .font(.system(.caption, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
                     }
+                    .padding(8)
                 }
-                .padding(8)
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(8)
+
+                Button {
+                    let text = proxyManager.logMessages
+                        .map { "\($0.timestamp.formatted(date: .omitted, time: .standard)) - \($0.message)" }
+                        .joined(separator: "\n")
+                    UIPasteboard.general.string = text
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.footnote)
+                        .padding(8)
+                        .background(Color.gray.opacity(0.3))
+                        .clipShape(Circle())
+                }
+                .padding(6)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.gray.opacity(0.1))
-            .cornerRadius(8)
         }
         .padding()
         .sheet(isPresented: Binding(
