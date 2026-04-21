@@ -22,11 +22,10 @@ import (
 // Returning error aborts the credential fetch.
 type CaptchaCallback func(captchaSid, captchaImg string) (answer string, err error)
 
+// iOS Safari profile — matches actual iPhone client so VK doesn't flag
+// mobile IP + desktop UA mismatch.
 const (
-	browserUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-	browserSecChUa       = `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`
-	browserSecChUaMobile = "?0"
-	browserSecChUaPlat   = `"Windows"`
+	browserUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 )
 
 func debugResp(resp map[string]any) string {
@@ -52,17 +51,16 @@ func newTLSClient() (tlsclient.HttpClient, error) {
 	jar := tlsclient.NewCookieJar()
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
 		tlsclient.WithTimeoutSeconds(30),
-		tlsclient.WithClientProfile(profiles.Chrome_146),
+		tlsclient.WithClientProfile(profiles.Safari_IOS_17_0),
 		tlsclient.WithCookieJar(jar),
 	)
 }
 
+// iOS Safari doesn't send sec-ch-* headers; keep this minimal and consistent.
 func applyBrowserHeaders(req *fhttp.Request) {
 	req.Header.Set("User-Agent", browserUserAgent)
-	req.Header.Set("sec-ch-ua", browserSecChUa)
-	req.Header.Set("sec-ch-ua-mobile", browserSecChUaMobile)
-	req.Header.Set("sec-ch-ua-platform", browserSecChUaPlat)
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 }
 
 // ------------ Captcha error parsing ------------
@@ -155,6 +153,24 @@ func getVKCreds(link string, dialer *dnsdialer.Dialer, captcha CaptchaCallback) 
 			return nil, raw, fmt.Errorf("json: %w, raw=%s", err, truncateStr(raw, 300))
 		}
 		return resp, raw, nil
+	}
+
+	// === Step 0: session warmup — visit the actual call link page like a real
+	// Safari user. VK sets initial cookies we'll carry through.
+	{
+		warmupURL := fmt.Sprintf("https://vk.com/call/join/%s", link)
+		req, wErr := fhttp.NewRequestWithContext(ctx, "GET", warmupURL, nil)
+		if wErr == nil {
+			applyBrowserHeaders(req)
+			req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+			req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9")
+			req.Header.Set("Upgrade-Insecure-Requests", "1")
+			if wResp, wErr := client.Do(req); wErr == nil {
+				_, _ = io.Copy(io.Discard, wResp.Body)
+				_ = wResp.Body.Close()
+			}
+		}
+		time.Sleep(400 * time.Millisecond)
 	}
 
 	// === Step 1: anonymous token ===
