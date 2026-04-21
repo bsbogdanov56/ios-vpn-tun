@@ -15,6 +15,7 @@ final class ProxyManager: ObservableObject {
     @Published private(set) var logMessages: [LogEntry] = []
     @Published var captchaImgURL: String? = nil
     @Published private(set) var captchaSid: String? = nil
+    @Published var captchaRedirectURL: URL? = nil
 
     private var proxyHandle: Int32 = -1
     private var statusTimer: Timer?
@@ -74,6 +75,7 @@ final class ProxyManager: ObservableObject {
                 self.statusText = "Disconnected"
                 self.captchaImgURL = nil
                 self.captchaSid = nil
+                self.captchaRedirectURL = nil
                 self.lastCaptchaSid = nil
                 self.addLog("Proxy stopped")
             }
@@ -95,6 +97,33 @@ final class ProxyManager: ObservableObject {
         }
         captchaImgURL = nil
         captchaSid = nil
+        captchaRedirectURL = nil
+    }
+
+    func submitSuccessToken(_ token: String) {
+        let handle = proxyHandle
+        addLog("Submitting success_token (len=\(token.count))")
+        Task.detached {
+            let ok = VKTurnBridge.submitSuccessToken(handle: handle, token: token)
+            await MainActor.run { [weak self] in
+                guard let self = self else { return }
+                if !ok {
+                    self.addLog("Submit success_token: no captcha awaited")
+                }
+            }
+        }
+        captchaImgURL = nil
+        captchaSid = nil
+        captchaRedirectURL = nil
+    }
+
+    func cancelCaptcha() {
+        captchaImgURL = nil
+        captchaSid = nil
+        captchaRedirectURL = nil
+        if isRunning {
+            Task { await disconnect() }
+        }
     }
 
     private func startStatusPolling() {
@@ -136,8 +165,15 @@ final class ProxyManager: ObservableObject {
                 addLog("Captcha required (sid=\(newSid ?? "?"))")
                 lastCaptchaSid = newSid
             }
-            captchaImgURL = status.captchaImg
             captchaSid = newSid
+            // Prefer WebView flow (id.vk.ru/not_robot_captcha) when available.
+            if let redir = status.captchaRedirectURI, let url = URL(string: redir) {
+                captchaRedirectURL = url
+                captchaImgURL = nil
+            } else {
+                captchaImgURL = status.captchaImg
+                captchaRedirectURL = nil
+            }
         case "stopped":
             statusText = "Stopped"
             if isRunning {

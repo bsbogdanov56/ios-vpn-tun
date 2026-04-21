@@ -87,6 +87,27 @@ func VKTurnSubmitCaptcha(handle int32, answer *C.char) int32 {
 	return -1
 }
 
+// VKTurnSubmitSuccessToken delivers a success_token (from id.vk.ru/not_robot_captcha
+// WebView flow) to the proxy. Returns 0 on success, -1 otherwise.
+//
+//export VKTurnSubmitSuccessToken
+func VKTurnSubmitSuccessToken(handle int32, token *C.char) int32 {
+	if token == nil {
+		return -1
+	}
+	t := C.GoString(token)
+	proxyHandlesMu.Lock()
+	instance, ok := proxyHandles[handle]
+	proxyHandlesMu.Unlock()
+	if !ok {
+		return -1
+	}
+	if instance.submitSuccessToken(t) {
+		return 0
+	}
+	return -1
+}
+
 //export VKTurnFreeString
 func VKTurnFreeString(s *C.char) {
 	if s != nil {

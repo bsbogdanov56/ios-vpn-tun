@@ -39,10 +39,16 @@ type proxyInstance struct {
 	lastError string
 
 	// Captcha coordination with Swift side
-	captchaMu       sync.Mutex
-	captchaImg      string
-	captchaSid      string
-	captchaAnswerCh chan string
+	captchaMu          sync.Mutex
+	captchaImg         string
+	captchaSid         string
+	captchaRedirectURI string
+	captchaAnswerCh    chan captchaAnswerMsg
+}
+
+type captchaAnswerMsg struct {
+	captchaKey   string
+	successToken string
 }
 
 type turnParams struct {
@@ -99,14 +105,15 @@ func (p *proxyInstance) stop() {
 	p.setState("stopped")
 }
 
-// requestCaptcha: called from getVKCreds. Publishes image+sid, blocks until
-// Swift submits an answer via VKTurnSubmitCaptcha, or ctx cancelled / 5min timeout.
-func (p *proxyInstance) requestCaptcha(sid, imgURL string) (string, error) {
-	ch := make(chan string, 1)
+// requestCaptcha publishes the captcha challenge to the Swift side and
+// blocks until an answer (key or success_token) is submitted.
+func (p *proxyInstance) requestCaptcha(sid, imgURL, redirectURI string) (CaptchaAnswer, error) {
+	ch := make(chan captchaAnswerMsg, 1)
 
 	p.captchaMu.Lock()
 	p.captchaImg = imgURL
 	p.captchaSid = sid
+	p.captchaRedirectURI = redirectURI
 	p.captchaAnswerCh = ch
 	p.captchaMu.Unlock()
 
@@ -116,6 +123,7 @@ func (p *proxyInstance) requestCaptcha(sid, imgURL string) (string, error) {
 		p.captchaMu.Lock()
 		p.captchaImg = ""
 		p.captchaSid = ""
+		p.captchaRedirectURI = ""
 		p.captchaAnswerCh = nil
 		p.captchaMu.Unlock()
 		p.statusMu.Lock()
@@ -126,12 +134,12 @@ func (p *proxyInstance) requestCaptcha(sid, imgURL string) (string, error) {
 	}()
 
 	select {
-	case answer := <-ch:
-		return answer, nil
+	case m := <-ch:
+		return CaptchaAnswer{CaptchaKey: m.captchaKey, SuccessToken: m.successToken}, nil
 	case <-p.ctx.Done():
-		return "", fmt.Errorf("context cancelled")
+		return CaptchaAnswer{}, fmt.Errorf("context cancelled")
 	case <-time.After(5 * time.Minute):
-		return "", fmt.Errorf("captcha timeout")
+		return CaptchaAnswer{}, fmt.Errorf("captcha timeout")
 	}
 }
 
@@ -143,7 +151,22 @@ func (p *proxyInstance) submitCaptcha(answer string) bool {
 		return false
 	}
 	select {
-	case ch <- answer:
+	case ch <- captchaAnswerMsg{captchaKey: answer}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *proxyInstance) submitSuccessToken(token string) bool {
+	p.captchaMu.Lock()
+	ch := p.captchaAnswerCh
+	p.captchaMu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- captchaAnswerMsg{successToken: token}:
 		return true
 	default:
 		return false
@@ -244,12 +267,20 @@ func (p *proxyInstance) statusJSON() string {
 	p.captchaMu.Lock()
 	img := p.captchaImg
 	sid := p.captchaSid
+	redirect := p.captchaRedirectURI
 	p.captchaMu.Unlock()
 
 	status := map[string]any{"state": state, "error": lastError}
-	if state == "captcha_needed" && img != "" {
-		status["captcha_img"] = img
-		status["captcha_sid"] = sid
+	if state == "captcha_needed" {
+		if img != "" {
+			status["captcha_img"] = img
+		}
+		if sid != "" {
+			status["captcha_sid"] = sid
+		}
+		if redirect != "" {
+			status["captcha_redirect_uri"] = redirect
+		}
 	}
 	b, err := json.Marshal(status)
 	if err != nil {

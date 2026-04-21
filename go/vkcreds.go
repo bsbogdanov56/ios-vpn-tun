@@ -17,10 +17,16 @@ import (
 	"github.com/google/uuid"
 )
 
+// CaptchaAnswer represents user's (or WebView's) response to a VK captcha.
+// Exactly one of the fields should be non-empty.
+type CaptchaAnswer struct {
+	CaptchaKey   string // plain text answer for image-style captcha
+	SuccessToken string // JWT token from id.vk.ru/not_robot_captcha WebView flow
+}
+
 // CaptchaCallback is invoked when VK returns error_code=14. Implementation
-// displays the image (captchaImg — either a remote URL or a data: URL) to the
-// user, waits for input, and returns the typed characters.
-type CaptchaCallback func(captchaSid, captchaImg string) (answer string, err error)
+// should present captchaImg OR open redirectURI (not_robot page) in a WebView.
+type CaptchaCallback func(captchaSid, captchaImg, redirectURI string) (CaptchaAnswer, error)
 
 // VK app credentials. Android/iOS official apps are placed first — they
 // have higher trust and are less likely to receive a blocker image.
@@ -95,6 +101,8 @@ type vkCaptchaError struct {
 	ErrorCode      int
 	CaptchaSid     string
 	CaptchaImg     string
+	RedirectURI    string
+	SessionToken   string
 	CaptchaTs      string
 	CaptchaAttempt string
 }
@@ -116,6 +124,28 @@ func parseVkCaptchaError(errData map[string]any) *vkCaptchaError {
 		}
 	}
 	captchaImg, _ := errData["captcha_img"].(string)
+	redirectURI, _ := errData["redirect_uri"].(string)
+
+	// session_token may be top-level OR embedded in redirect_uri query.
+	sessionToken, _ := errData["session_token"].(string)
+	if sessionToken == "" && redirectURI != "" {
+		if u, err := neturl.Parse(redirectURI); err == nil {
+			sessionToken = u.Query().Get("session_token")
+		}
+	}
+
+	// Ensure redirect_uri carries the session_token in its query — WebView
+	// loads this URL directly.
+	if redirectURI != "" && sessionToken != "" {
+		if u, err := neturl.Parse(redirectURI); err == nil {
+			q := u.Query()
+			if q.Get("session_token") == "" {
+				q.Set("session_token", sessionToken)
+				u.RawQuery = q.Encode()
+				redirectURI = u.String()
+			}
+		}
+	}
 
 	var captchaTs string
 	if n, ok := errData["captcha_ts"].(float64); ok {
@@ -135,6 +165,8 @@ func parseVkCaptchaError(errData map[string]any) *vkCaptchaError {
 		ErrorCode:      code,
 		CaptchaSid:     captchaSid,
 		CaptchaImg:     captchaImg,
+		RedirectURI:    redirectURI,
+		SessionToken:   sessionToken,
 		CaptchaTs:      captchaTs,
 		CaptchaAttempt: captchaAttempt,
 	}
@@ -289,27 +321,39 @@ func tryAuthWithApp(link string, captcha CaptchaCallback, app vkApp) (string, st
 			return "", "", "", fmt.Errorf("step2 captcha but no callback")
 		}
 
-		// Fetch image via our session → data URL
+		// Fetch image via our session → data URL (used for legacy image modal fallback).
 		imgForUser := capErr.CaptchaImg
 		if dataURL, fErr := fetchCaptchaImageDataURL(ctx, client, app.UserAgent, capErr.CaptchaImg); fErr == nil && dataURL != "" {
 			imgForUser = dataURL
 		}
 
-		answer, solveErr := captcha(capErr.CaptchaSid, imgForUser)
+		ans, solveErr := captcha(capErr.CaptchaSid, imgForUser, capErr.RedirectURI)
 		if solveErr != nil {
 			return "", "", "", fmt.Errorf("captcha callback: %w", solveErr)
 		}
-		if strings.TrimSpace(answer) == "" {
-			return "", "", "", fmt.Errorf("captcha answer empty")
-		}
 
-		extra = fmt.Sprintf("&captcha_key=%s&captcha_sid=%s",
-			neturl.QueryEscape(answer), capErr.CaptchaSid)
-		if capErr.CaptchaTs != "" {
-			extra += "&captcha_ts=" + capErr.CaptchaTs
-		}
-		if capErr.CaptchaAttempt != "" {
-			extra += "&captcha_attempt=" + capErr.CaptchaAttempt
+		if ans.SuccessToken != "" {
+			// WebView-based flow: pass success_token back to VK.
+			extra = fmt.Sprintf("&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s",
+				capErr.CaptchaSid, neturl.QueryEscape(ans.SuccessToken))
+			if capErr.CaptchaTs != "" {
+				extra += "&captcha_ts=" + capErr.CaptchaTs
+			}
+			if capErr.CaptchaAttempt != "" {
+				extra += "&captcha_attempt=" + capErr.CaptchaAttempt
+			}
+		} else if strings.TrimSpace(ans.CaptchaKey) != "" {
+			// Manual image modal flow: pass captcha_key text.
+			extra = fmt.Sprintf("&captcha_key=%s&captcha_sid=%s",
+				neturl.QueryEscape(ans.CaptchaKey), capErr.CaptchaSid)
+			if capErr.CaptchaTs != "" {
+				extra += "&captcha_ts=" + capErr.CaptchaTs
+			}
+			if capErr.CaptchaAttempt != "" {
+				extra += "&captcha_attempt=" + capErr.CaptchaAttempt
+			}
+		} else {
+			return "", "", "", fmt.Errorf("captcha answer empty")
 		}
 
 		time.Sleep(400 * time.Millisecond)

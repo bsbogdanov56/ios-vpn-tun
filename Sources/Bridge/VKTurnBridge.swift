@@ -13,12 +13,14 @@ public struct ProxyStatus: Codable {
     let error: String
     let captchaImg: String?
     let captchaSid: String?
+    let captchaRedirectURI: String?
 
     enum CodingKeys: String, CodingKey {
         case state
         case error
         case captchaImg = "captcha_img"
         case captchaSid = "captcha_sid"
+        case captchaRedirectURI = "captcha_redirect_uri"
     }
 }
 
@@ -50,6 +52,12 @@ final class VKTurnBridge {
     static func submitCaptcha(handle: Int32, answer: String) -> Bool {
         return answer.withCString { ansPtr in
             return VKTurnSubmitCaptcha(handle, UnsafeMutablePointer(mutating: ansPtr)) == 0
+        }
+    }
+
+    static func submitSuccessToken(handle: Int32, token: String) -> Bool {
+        return token.withCString { tokPtr in
+            return VKTurnSubmitSuccessToken(handle, UnsafeMutablePointer(mutating: tokPtr)) == 0
         }
     }
 }
