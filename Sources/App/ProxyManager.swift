@@ -8,8 +8,14 @@ struct LogEntry: Identifiable, Hashable {
     let message: String
 }
 
-/// Observable proxy manager for SwiftUI lifecycle
-/// Manages proxy connection state and status polling
+/// Observable proxy manager for SwiftUI lifecycle.
+/// Flow:
+///   1. connect() starts a Go proxy instance (no VK auth happens inside Go).
+///   2. Go waits on an internal channel for TURN credentials.
+///   3. In parallel, Swift opens a WKWebView to the VK call link; JS hook
+///      watches RTCPeerConnection and XHR/fetch responses for TURN creds.
+///   4. When JS reports creds, we pass them to Go via VKTurnSubmitTurnCreds.
+///   5. Go unblocks, builds the TURN tunnel. WebView closes automatically.
 @MainActor
 final class ProxyManager: ObservableObject {
 
@@ -18,20 +24,16 @@ final class ProxyManager: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var statusText = "Disconnected"
     @Published private(set) var logMessages: [LogEntry] = []
-    @Published var captchaImgURL: String? = nil
-    @Published private(set) var captchaSid: String? = nil
+    /// When non-nil, ContentView presents the VK captcha WebView sheet.
+    @Published var webViewURL: URL? = nil
 
     // MARK: - Private State
 
     private var proxyHandle: Int32 = -1
     private var statusTimer: Timer?
-    private let statusQueue = DispatchQueue(label: "com.vkturn.statusQueue", qos: .utility)
-    private let maxLogEntries = 100
-    private var lastCaptchaSid: String? = nil
+    private let maxLogEntries = 200
 
-    // MARK: - Configuration
-
-    private var currentConfig: ProxyConfig?
+    private var credsSubmitted = false
 
     // MARK: - Lifecycle
 
@@ -45,25 +47,26 @@ final class ProxyManager: ObservableObject {
 
     // MARK: - Public API
 
-    /// Connect to VK TURN server with given configuration
-    /// - Parameter config: Proxy configuration
     func connect(config: ProxyConfig) {
-        guard !isRunning else {
-            addLog("Already connected")
+        guard !isRunning && webViewURL == nil else {
+            addLog("Already connecting")
             return
         }
 
-        currentConfig = config
-        addLog("Starting proxy connection...")
-        statusText = "Connecting..."
+        guard let vkURL = URL(string: config.vkLink) else {
+            addLog("Invalid VK link")
+            return
+        }
 
-        // Start proxy on background queue
+        addLog("Starting proxy connection...")
+        statusText = "Waiting for captcha (browser)"
+        credsSubmitted = false
+
+        // 1. Start the Go proxy — it will block waiting for TURN creds.
         Task.detached { [weak self] in
             let handle = VKTurnBridge.startProxy(config: config)
-
             await MainActor.run {
                 guard let self = self else { return }
-
                 if handle >= 0 {
                     self.proxyHandle = handle
                     self.isRunning = true
@@ -75,13 +78,18 @@ final class ProxyManager: ObservableObject {
                 }
             }
         }
+
+        // 2. Open the WebView so the user can solve VK's captcha.
+        webViewURL = vkURL
     }
 
-    /// Disconnect from VK TURN server
     @MainActor
     func disconnect() async {
+        webViewURL = nil
+
         guard isRunning else {
             addLog("Not connected")
+            statusText = "Disconnected"
             return
         }
 
@@ -90,56 +98,67 @@ final class ProxyManager: ObservableObject {
         let handle = proxyHandle
         addLog("Stopping proxy with handle \(handle)...")
 
-        // Stop proxy on background queue
         Task.detached { [weak self] in
             VKTurnBridge.stopProxy(handle: handle)
-
             await MainActor.run {
                 guard let self = self else { return }
                 self.proxyHandle = -1
                 self.isRunning = false
                 self.statusText = "Disconnected"
-                self.captchaImgURL = nil
-                self.captchaSid = nil
-                self.lastCaptchaSid = nil
+                self.credsSubmitted = false
                 self.addLog("Proxy stopped")
             }
         }
     }
 
-    /// Submit a user-entered captcha answer to the Go proxy.
-    func submitCaptchaAnswer(_ answer: String) {
-        let handle = proxyHandle
-        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        addLog("Submitting captcha: \(trimmed)")
-        Task.detached {
-            let ok = VKTurnBridge.submitCaptcha(handle: handle, answer: trimmed)
-            await MainActor.run { [weak self] in
-                guard let self = self else { return }
-                if !ok {
-                    self.addLog("Submit captcha: no captcha awaited (maybe already stopped)")
-                }
+    /// User cancelled the WebView. Stop the Go-side wait too.
+    func cancelWebView() {
+        webViewURL = nil
+        if isRunning && !credsSubmitted {
+            Task {
+                await disconnect()
             }
         }
-        // Hide UI immediately; Go will re-surface another captcha if the answer is wrong.
-        captchaImgURL = nil
-        captchaSid = nil
+    }
+
+    /// JS hook in WebView captured TURN creds. Pass them to Go and close sheet.
+    func submitTurnCreds(user: String, credential: String, urls: [String]) {
+        guard !credsSubmitted else { return }
+        credsSubmitted = true
+
+        // Take the first URL, strip "turn:"/"turns:" scheme and any ?query.
+        let server = normalizeTurnURL(urls.first ?? "")
+        addLog("Captured TURN creds: user=\(user) server=\(server)")
+
+        let handle = proxyHandle
+        Task.detached {
+            _ = VKTurnBridge.submitTurnCreds(handle: handle, username: user, credential: credential, server: server)
+        }
+
+        // Close WebView.
+        webViewURL = nil
+    }
+
+    private func normalizeTurnURL(_ raw: String) -> String {
+        var s = raw
+        if let q = s.firstIndex(of: "?") {
+            s = String(s[..<q])
+        }
+        if s.hasPrefix("turns:") { s.removeFirst("turns:".count) }
+        else if s.hasPrefix("turn:") { s.removeFirst("turn:".count) }
+        return s
     }
 
     // MARK: - Status Polling
 
     private func startStatusPolling() {
         stopStatusPolling()
-
-        // Poll status every second
         statusTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             Task {
                 await self.pollStatus()
             }
         }
-
-        // Initial poll
         Task {
             await pollStatus()
         }
@@ -152,8 +171,6 @@ final class ProxyManager: ObservableObject {
 
     private func pollStatus() async {
         let handle = proxyHandle
-
-        // Query status on background queue
         let status: ProxyStatus? = await Task.detached {
             return VKTurnBridge.getStatus(handle: handle)
         }.value
@@ -163,23 +180,9 @@ final class ProxyManager: ObservableObject {
             return
         }
 
-        // Update UI on main thread
         switch status.state {
         case "running":
-            statusText = "Running"
-            if captchaImgURL != nil {
-                captchaImgURL = nil
-                captchaSid = nil
-            }
-        case "captcha_needed":
-            statusText = "Captcha Required"
-            let newSid = status.captchaSid
-            if newSid != lastCaptchaSid {
-                addLog("Captcha required (sid=\(newSid ?? "?"))")
-                lastCaptchaSid = newSid
-            }
-            captchaImgURL = status.captchaImg
-            captchaSid = newSid
+            statusText = credsSubmitted ? "Running" : "Waiting for captcha (browser)"
         case "stopped":
             statusText = "Stopped"
             if isRunning {
@@ -199,7 +202,7 @@ final class ProxyManager: ObservableObject {
                 await disconnect()
             }
         default:
-            statusText = "Unknown State: \(status.state)"
+            statusText = "State: \(status.state)"
         }
     }
 
@@ -208,23 +211,8 @@ final class ProxyManager: ObservableObject {
     private func addLog(_ message: String) {
         let entry = LogEntry(timestamp: Date(), message: message)
         logMessages.append(entry)
-
-        // Limit log entries to prevent unbounded growth
         if logMessages.count > maxLogEntries {
             logMessages.removeFirst(logMessages.count - maxLogEntries)
         }
-    }
-
-    // MARK: - Convenience
-
-    /// Create default configuration for testing
-    static func defaultConfig() -> ProxyConfig {
-        ProxyConfig(
-            peer: "1.2.3.4:51820",
-            vkLink: "https://vk.com/call/join/XXXX",
-            listen: "127.0.0.1:9000",
-            streams: 1,
-            udp: false
-        )
     }
 }

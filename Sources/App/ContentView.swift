@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 struct ContentView: View {
     @StateObject private var proxyManager = ProxyManager()
@@ -63,18 +64,21 @@ struct ContentView: View {
         }
         .padding()
         .sheet(isPresented: Binding(
-            get: { proxyManager.captchaImgURL != nil },
+            get: { proxyManager.webViewURL != nil },
             set: { newValue in
                 if !newValue {
-                    proxyManager.captchaImgURL = nil
+                    proxyManager.cancelWebView()
                 }
             }
         )) {
-            if let imgURL = proxyManager.captchaImgURL {
-                CaptchaView(
-                    imgURL: imgURL,
-                    onSubmit: { answer in
-                        proxyManager.submitCaptchaAnswer(answer)
+            if let url = proxyManager.webViewURL {
+                VKCallWebView(
+                    url: url,
+                    onCredsReceived: { user, pass, urls in
+                        proxyManager.submitTurnCreds(user: user, credential: pass, urls: urls)
+                    },
+                    onCancel: {
+                        proxyManager.cancelWebView()
                     }
                 )
             }
@@ -82,7 +86,7 @@ struct ContentView: View {
     }
 
     private func toggleConnection() {
-        if proxyManager.isRunning {
+        if proxyManager.isRunning || proxyManager.webViewURL != nil {
             Task {
                 await proxyManager.disconnect()
             }
@@ -99,110 +103,203 @@ struct ContentView: View {
     }
 }
 
-struct CaptchaView: View {
-    let imgURL: String
-    let onSubmit: (String) -> Void
-    @Environment(\.dismiss) private var dismiss
-    @State private var answer: String = ""
+// MARK: - VK Call WebView
+
+/// SwiftUI wrapper around WKWebView that loads the VK call page and
+/// intercepts TURN credentials as soon as VK hands them to the web client
+/// (either via RTCPeerConnection or via XHR/fetch to calls.okcdn.ru).
+struct VKCallWebView: View {
+    let url: URL
+    let onCredsReceived: (String, String, [String]) -> Void
+    let onCancel: () -> Void
+
+    @State private var progress: Double = 0
 
     var body: some View {
-        VStack(spacing: 20) {
-            Text("Введите капчу")
-                .font(.title2)
-                .bold()
-                .padding(.top, 24)
-
-            Text("VK требует подтвердить, что ты не бот.")
-                .font(.footnote)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-
-            captchaImageView
-
-            TextField("Ответ", text: $answer)
-                .textFieldStyle(RoundedBorderTextFieldStyle())
-                .textInputAutocapitalization(.never)
-                .disableAutocorrection(true)
-                .font(.title3)
-
-            HStack(spacing: 12) {
-                Button("Отмена") {
-                    dismiss()
+        NavigationView {
+            VStack(spacing: 0) {
+                if progress > 0 && progress < 1 {
+                    ProgressView(value: progress).padding(.horizontal)
                 }
-                .foregroundColor(.red)
-                .padding()
-                .frame(maxWidth: .infinity)
-                .background(Color.gray.opacity(0.15))
-                .cornerRadius(8)
-
-                Button("Отправить") {
-                    onSubmit(answer)
-                    dismiss()
-                }
-                .foregroundColor(.green)
-                .padding()
-                .frame(maxWidth: .infinity)
-                .background(Color.gray.opacity(0.15))
-                .cornerRadius(8)
-                .disabled(answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                WebViewRepresentable(
+                    url: url,
+                    onCredsReceived: onCredsReceived,
+                    progress: $progress
+                )
             }
-
-            Spacer()
-        }
-        .padding()
-    }
-
-    /// Renders either a remote URL via AsyncImage or a `data:image/...;base64,...`
-    /// URL by decoding the bytes directly (URLSession doesn't fetch data: URLs).
-    @ViewBuilder
-    private var captchaImageView: some View {
-        if imgURL.hasPrefix("data:") {
-            if let uiImage = decodeDataURLImage(imgURL) {
-                Image(uiImage: uiImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxHeight: 140)
-                    .background(Color.white)
-                    .cornerRadius(6)
-            } else {
-                errorImagePlaceholder
-            }
-        } else {
-            AsyncImage(url: URL(string: imgURL)) { phase in
-                switch phase {
-                case .empty:
-                    ProgressView().frame(height: 80)
-                case .success(let image):
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxHeight: 140)
-                        .background(Color.white)
-                        .cornerRadius(6)
-                case .failure:
-                    errorImagePlaceholder
-                @unknown default:
-                    ProgressView()
-                }
-            }
+            .navigationBarTitle("Решите капчу VK", displayMode: .inline)
+            .navigationBarItems(
+                leading: Button("Отмена", action: onCancel)
+                    .foregroundColor(.red)
+            )
         }
     }
+}
 
-    private var errorImagePlaceholder: some View {
-        VStack {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.largeTitle)
-                .foregroundColor(.orange)
-            Text("Не удалось загрузить картинку")
-                .font(.footnote)
-        }
-        .frame(height: 100)
+private struct WebViewRepresentable: UIViewRepresentable {
+    let url: URL
+    let onCredsReceived: (String, String, [String]) -> Void
+    @Binding var progress: Double
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onCredsReceived: onCredsReceived, progressBinding: $progress)
     }
 
-    private func decodeDataURLImage(_ url: String) -> UIImage? {
-        guard let commaIdx = url.firstIndex(of: ",") else { return nil }
-        let base64Part = String(url[url.index(after: commaIdx)...])
-        guard let data = Data(base64Encoded: base64Part) else { return nil }
-        return UIImage(data: data)
+    func makeUIView(context: Context) -> WKWebView {
+        let contentController = WKUserContentController()
+        contentController.add(context.coordinator, name: "turnCreds")
+
+        let hookScript = Self.hookScript()
+        contentController.addUserScript(
+            WKUserScript(source: hookScript, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        )
+
+        let config = WKWebViewConfiguration()
+        config.userContentController = contentController
+        // Fresh data store — no carried-over cookies/localStorage from previous attempts.
+        // VK's "bot reputation" resets with each WebView session.
+        config.websiteDataStore = .nonPersistent()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.allowsBackForwardNavigationGestures = true
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+
+        webView.load(URLRequest(url: url))
+
+        // KVO for progress
+        context.coordinator.observe(webView: webView)
+
+        return webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+
+    static func hookScript() -> String {
+        return """
+        (function() {
+            var captured = false;
+            function emit(username, credential, urls) {
+                if (captured) return;
+                if (!username || !credential) return;
+                if (!urls || (Array.isArray(urls) && urls.length === 0)) return;
+                if (typeof urls === 'string') urls = [urls];
+                captured = true;
+                try {
+                    window.webkit.messageHandlers.turnCreds.postMessage({
+                        username: String(username),
+                        credential: String(credential),
+                        urls: urls.map(String)
+                    });
+                } catch (e) {}
+            }
+
+            function scanIceServers(cfg) {
+                if (!cfg || !cfg.iceServers) return;
+                for (var i = 0; i < cfg.iceServers.length; i++) {
+                    var srv = cfg.iceServers[i];
+                    if (!srv) continue;
+                    if (srv.username && srv.credential) {
+                        var urls = srv.urls || (srv.url ? [srv.url] : []);
+                        emit(srv.username, srv.credential, urls);
+                        return;
+                    }
+                }
+            }
+
+            var origRTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+            if (origRTC) {
+                var Wrapped = function(cfg) {
+                    scanIceServers(cfg);
+                    return new origRTC(cfg);
+                };
+                Wrapped.prototype = origRTC.prototype;
+                window.RTCPeerConnection = Wrapped;
+                if (window.webkitRTCPeerConnection) { window.webkitRTCPeerConnection = Wrapped; }
+            }
+
+            function inspectBody(body) {
+                if (!body || typeof body !== 'object') return;
+                if (body.turn_server && body.turn_server.username) {
+                    var ts = body.turn_server;
+                    var urls = ts.urls || (ts.url ? [ts.url] : []);
+                    emit(ts.username, ts.credential, urls);
+                }
+                if (body.response) inspectBody(body.response);
+                if (Array.isArray(body.ice_servers)) {
+                    scanIceServers({iceServers: body.ice_servers});
+                }
+            }
+
+            var origFetch = window.fetch;
+            if (origFetch) {
+                window.fetch = function() {
+                    var p = origFetch.apply(this, arguments);
+                    try {
+                        p.then(function(resp) {
+                            return resp.clone().text();
+                        }).then(function(text) {
+                            try {
+                                var data = JSON.parse(text);
+                                inspectBody(data);
+                            } catch (e) {}
+                        }).catch(function() {});
+                    } catch (e) {}
+                    return p;
+                };
+            }
+
+            var origOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function() {
+                this._vkHookUrl = arguments[1] || '';
+                return origOpen.apply(this, arguments);
+            };
+            var origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function() {
+                var xhr = this;
+                xhr.addEventListener('load', function() {
+                    try {
+                        var ct = xhr.getResponseHeader && xhr.getResponseHeader('content-type') || '';
+                        if (ct.indexOf('json') === -1 && ct.indexOf('javascript') === -1) return;
+                        var data = JSON.parse(xhr.responseText);
+                        inspectBody(data);
+                    } catch (e) {}
+                });
+                return origSend.apply(this, arguments);
+            };
+        })();
+        """
+    }
+
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+        let onCredsReceived: (String, String, [String]) -> Void
+        private let progressBinding: Binding<Double>
+        private var observation: NSKeyValueObservation?
+
+        init(onCredsReceived: @escaping (String, String, [String]) -> Void, progressBinding: Binding<Double>) {
+            self.onCredsReceived = onCredsReceived
+            self.progressBinding = progressBinding
+        }
+
+        func observe(webView: WKWebView) {
+            observation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
+                DispatchQueue.main.async {
+                    self?.progressBinding.wrappedValue = webView.estimatedProgress
+                }
+            }
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == "turnCreds" else { return }
+            guard let dict = message.body as? [String: Any],
+                  let username = dict["username"] as? String,
+                  let credential = dict["credential"] as? String,
+                  let urls = dict["urls"] as? [String] else {
+                return
+            }
+            onCredsReceived(username, credential, urls)
+        }
     }
 }

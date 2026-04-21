@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bschaatsbergen/dnsdialer"
 	"github.com/pion/logging"
 	"github.com/pion/turn/v5"
 )
@@ -28,6 +27,13 @@ type proxyConfig struct {
 	TurnPort string `json:"turnPort,omitempty"`
 }
 
+// turnCreds are fetched by the Swift-side WebView and submitted into the proxy.
+type turnCreds struct {
+	Username string
+	Password string
+	Server   string // host:port, no scheme
+}
+
 type proxyInstance struct {
 	handle    int32
 	cfg       proxyConfig
@@ -38,11 +44,10 @@ type proxyInstance struct {
 	state     string
 	lastError string
 
-	// Captcha coordination
-	captchaMu       sync.Mutex
-	captchaImg      string
-	captchaSid      string
-	captchaAnswerCh chan string
+	// Cred exchange with Swift
+	credsMu sync.Mutex
+	creds   *turnCreds
+	credsCh chan struct{} // closed once creds are submitted
 }
 
 type turnParams struct {
@@ -78,15 +83,16 @@ func newProxyInstance(cfg proxyConfig) (*proxyInstance, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &proxyInstance{
-		cfg:    cfg,
-		ctx:    ctx,
-		cancel: cancel,
-		state:  "created",
+		cfg:     cfg,
+		ctx:     ctx,
+		cancel:  cancel,
+		state:   "created",
+		credsCh: make(chan struct{}),
 	}, nil
 }
 
 func (p *proxyInstance) start() {
-	p.setState("starting")
+	p.setState("waiting_creds")
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -98,6 +104,35 @@ func (p *proxyInstance) stop() {
 	p.cancel()
 	p.wg.Wait()
 	p.setState("stopped")
+}
+
+// submitTurnCreds is called from the C bridge when Swift's WebView hooks fire.
+// Returns true on first submission, false on subsequent ones.
+func (p *proxyInstance) submitTurnCreds(user, pass, server string) bool {
+	p.credsMu.Lock()
+	defer p.credsMu.Unlock()
+	if p.creds != nil {
+		return false
+	}
+	p.creds = &turnCreds{Username: user, Password: pass, Server: server}
+	close(p.credsCh) // signal all waiters
+	return true
+}
+
+// waitForCreds blocks until creds are submitted or the proxy is cancelled.
+func (p *proxyInstance) waitForCreds() (string, string, string, error) {
+	select {
+	case <-p.credsCh:
+		p.credsMu.Lock()
+		c := p.creds
+		p.credsMu.Unlock()
+		if c == nil {
+			return "", "", "", errors.New("creds nil after channel close")
+		}
+		return c.Username, c.Password, c.Server, nil
+	case <-p.ctx.Done():
+		return "", "", "", p.ctx.Err()
+	}
 }
 
 func (p *proxyInstance) run() {
@@ -113,20 +148,14 @@ func (p *proxyInstance) run() {
 		return
 	}
 
-	dialer := dnsdialer.New(
-		dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53"),
-		dnsdialer.WithStrategy(dnsdialer.Fallback{}),
-		dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
-	)
-
 	params := &turnParams{
 		host:      p.cfg.TurnHost,
 		port:      p.cfg.TurnPort,
 		link:      link,
 		udp:       p.cfg.UDP,
 		reportErr: p.setError,
-		getCreds: func(s string) (string, string, string, error) {
-			return getVKCreds(s, dialer, p.requestCaptcha)
+		getCreds: func(_ string) (string, string, string, error) {
+			return p.waitForCreds()
 		},
 	}
 
@@ -191,80 +220,14 @@ func (p *proxyInstance) setError(err error) {
 	p.lastError = err.Error()
 }
 
-// requestCaptcha is called from getVKCreds when VK demands captcha solving.
-// Publishes the image URL + sid into status; blocks until Swift calls
-// submitCaptcha or context is cancelled or 5 minutes pass.
-func (p *proxyInstance) requestCaptcha(sid, imgURL string) (string, error) {
-	ch := make(chan string, 1)
-
-	p.captchaMu.Lock()
-	p.captchaImg = imgURL
-	p.captchaSid = sid
-	p.captchaAnswerCh = ch
-	p.captchaMu.Unlock()
-
-	p.setState("captcha_needed")
-
-	defer func() {
-		p.captchaMu.Lock()
-		p.captchaImg = ""
-		p.captchaSid = ""
-		p.captchaAnswerCh = nil
-		p.captchaMu.Unlock()
-		// restore state back to running if we were running (best effort)
-		p.statusMu.Lock()
-		if p.state == "captcha_needed" {
-			p.state = "running"
-		}
-		p.statusMu.Unlock()
-	}()
-
-	select {
-	case answer := <-ch:
-		return answer, nil
-	case <-p.ctx.Done():
-		return "", fmt.Errorf("context cancelled during captcha wait")
-	case <-time.After(5 * time.Minute):
-		return "", fmt.Errorf("captcha timeout (5 min)")
-	}
-}
-
-// submitCaptcha is called from the C bridge when the user submits a captcha answer.
-// Returns true if delivered, false if no captcha was currently awaited.
-func (p *proxyInstance) submitCaptcha(answer string) bool {
-	p.captchaMu.Lock()
-	ch := p.captchaAnswerCh
-	p.captchaMu.Unlock()
-	if ch == nil {
-		return false
-	}
-	select {
-	case ch <- answer:
-		return true
-	default:
-		return false
-	}
-}
-
 func (p *proxyInstance) statusJSON() string {
 	p.statusMu.RLock()
-	state := p.state
-	lastError := p.lastError
+	status := map[string]any{
+		"state": p.state,
+		"error": p.lastError,
+	}
 	p.statusMu.RUnlock()
 
-	p.captchaMu.Lock()
-	img := p.captchaImg
-	sid := p.captchaSid
-	p.captchaMu.Unlock()
-
-	status := map[string]any{
-		"state": state,
-		"error": lastError,
-	}
-	if state == "captcha_needed" && img != "" {
-		status["captcha_img"] = img
-		status["captcha_sid"] = sid
-	}
 	b, err := json.Marshal(status)
 	if err != nil {
 		return `{"state":"error","error":"marshal status failed"}`

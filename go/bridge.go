@@ -74,15 +74,18 @@ func VKTurnGetStatus(handle int32) *C.char {
 	return C.CString(instance.statusJSON())
 }
 
-// VKTurnSubmitCaptcha delivers a user-entered captcha answer to the proxy
-// instance that's currently waiting on one. Returns 0 on success, -1 otherwise.
+// VKTurnSubmitTurnCreds delivers WebView-captured TURN credentials to the Go
+// proxy instance that's currently waiting for them. Returns 0 on success, -1
+// on invalid handle or duplicate submission.
 //
-//export VKTurnSubmitCaptcha
-func VKTurnSubmitCaptcha(handle int32, answer *C.char) int32 {
-	if answer == nil {
+//export VKTurnSubmitTurnCreds
+func VKTurnSubmitTurnCreds(handle int32, username *C.char, credential *C.char, server *C.char) int32 {
+	if username == nil || credential == nil || server == nil {
 		return -1
 	}
-	ans := C.GoString(answer)
+	u := C.GoString(username)
+	c := C.GoString(credential)
+	s := C.GoString(server)
 
 	proxyHandlesMu.Lock()
 	instance, ok := proxyHandles[handle]
@@ -92,7 +95,7 @@ func VKTurnSubmitCaptcha(handle int32, answer *C.char) int32 {
 		return -1
 	}
 
-	if instance.submitCaptcha(ans) {
+	if instance.submitTurnCreds(u, c, s) {
 		return 0
 	}
 	return -1
