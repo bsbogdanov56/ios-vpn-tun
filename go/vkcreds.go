@@ -155,9 +155,44 @@ func parseVkCaptchaError(errData map[string]any) *vkCaptchaError {
 
 // ------------ Main credentials flow ------------
 
-func getVKCreds(link string, dialer *dnsdialer.Dialer, captcha CaptchaCallback) (string, string, string, error) {
-	_ = dialer // not used; tls-client handles its own DNS
+// VK applications we rotate through if one gets "forced" (poisoned) captchas.
+// Matches alxmcp/cacggghp's proven set.
+type vkApp struct {
+	ClientID     string
+	ClientSecret string
+}
 
+var vkApps = []vkApp{
+	{ClientID: "6287487", ClientSecret: "QbYic1K3lEV5kTGiqlq2"},   // VK_WEB_APP
+	{ClientID: "7879029", ClientSecret: "aR5NKGmm03GYrCiNKsaw"},   // VK_MVK_APP (mobile web)
+	{ClientID: "52461373", ClientSecret: "o557NLIkAErNhakXrQ7A"},  // VK_WEB_VKVIDEO_APP
+	{ClientID: "52649896", ClientSecret: "WStp4ihWG4l3nmXZgIbC"},  // VK_MVK_VKVIDEO_APP
+	{ClientID: "51781872", ClientSecret: "IjjCNl4L4Tf5QZEXIHKK"},  // VK_ID_AUTH_APP
+}
+
+func getVKCreds(link string, dialer *dnsdialer.Dialer, captcha CaptchaCallback) (string, string, string, error) {
+	_ = dialer
+
+	// Try each VK app in order. Stop at the first one that succeeds, or that
+	// raises a non-captcha error (network issues, VK fundamentally off).
+	var lastErr error
+	for appIdx, app := range vkApps {
+		u, p, a, err := tryGetVKCreds(link, captcha, app)
+		if err == nil {
+			return u, p, a, nil
+		}
+		lastErr = err
+
+		errStr := err.Error()
+		// Rotate only on captcha/step2 problems. Other steps won't change with a different client_id.
+		if !(strings.Contains(errStr, "step2") || strings.Contains(errStr, "captcha")) {
+			return "", "", "", fmt.Errorf("app %d/%d (%s): %w", appIdx+1, len(vkApps), app.ClientID, err)
+		}
+	}
+	return "", "", "", fmt.Errorf("all %d VK apps exhausted: %w", len(vkApps), lastErr)
+}
+
+func tryGetVKCreds(link string, captcha CaptchaCallback, app vkApp) (string, string, string, error) {
 	ctx := context.Background()
 	client, err := newTLSClient()
 	if err != nil {
@@ -213,7 +248,7 @@ func getVKCreds(link string, dialer *dnsdialer.Dialer, captcha CaptchaCallback) 
 	}
 
 	// === Step 1: anonymous token ===
-	data := "client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487"
+	data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s", app.ClientID, app.ClientSecret, app.ClientID)
 	url := "https://login.vk.ru/?act=get_anonym_token"
 
 	resp, raw, err := doRequest(data, url)
@@ -235,7 +270,7 @@ func getVKCreds(link string, dialer *dnsdialer.Dialer, captcha CaptchaCallback) 
 
 	// === Step 1.5: getCallPreview (session warmup) ===
 	previewData := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&fields=photo_200&access_token=%s", link, token1)
-	previewURL := "https://api.vk.ru/method/calls.getCallPreview?v=5.275&client_id=6287487"
+	previewURL := fmt.Sprintf("https://api.vk.ru/method/calls.getCallPreview?v=5.275&client_id=%s", app.ClientID)
 	_, _, _ = doRequest(previewData, previewURL)
 
 	time.Sleep(300 * time.Millisecond)
@@ -244,7 +279,7 @@ func getVKCreds(link string, dialer *dnsdialer.Dialer, captcha CaptchaCallback) 
 	makeStep2Data := func(extraCaptcha string) string {
 		return fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=Александр&access_token=%s%s", link, token1, extraCaptcha)
 	}
-	step2URL := "https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=6287487"
+	step2URL := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=%s", app.ClientID)
 
 	var token2 string
 	for attempt := 0; attempt < 5; attempt++ {
@@ -279,6 +314,14 @@ func getVKCreds(link string, dialer *dnsdialer.Dialer, captcha CaptchaCallback) 
 		}
 		if capErr.CaptchaImg == "" || capErr.CaptchaSid == "" {
 			return "", "", "", fmt.Errorf("step2 captcha missing img or sid | body=%s", debugResp(resp))
+		}
+
+		// If VK marked this captcha "_forced_" in the source, it's a poisoned
+		// challenge (returns the "update the app" block image no matter what).
+		// Don't bother the user — bubble an error so the outer loop can rotate
+		// to a different client_id.
+		if strings.Contains(capErr.CaptchaImg, "_forced_") {
+			return "", "", "", fmt.Errorf("step2 got forced (poisoned) captcha for app %s — rotating", app.ClientID)
 		}
 
 		if captcha == nil {
