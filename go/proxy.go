@@ -38,6 +38,15 @@ type proxyInstance struct {
 	state     string
 	lastError string
 
+	// Cached TURN credentials — avoid re-running the VK auth chain (and thus
+	// hitting VK DNS endpoints) on every reconnect, because once WireGuard is
+	// up, system DNS gets routed through the VPN too → circular dependency.
+	credsMu       sync.Mutex
+	cachedUser    string
+	cachedPass    string
+	cachedAddr    string
+	cachedExpires time.Time
+
 	// Captcha coordination with Swift side
 	captchaMu          sync.Mutex
 	captchaImg         string
@@ -45,6 +54,8 @@ type proxyInstance struct {
 	captchaRedirectURI string
 	captchaAnswerCh    chan captchaAnswerMsg
 }
+
+const turnCredsCacheLifetime = 9 * time.Minute
 
 type captchaAnswerMsg struct {
 	captchaKey   string
@@ -196,7 +207,29 @@ func (p *proxyInstance) run() {
 		udp:       p.cfg.UDP,
 		reportErr: p.setError,
 		getCreds: func(s string) (string, string, string, error) {
-			return getVKCreds(s, dialer, p.requestCaptcha)
+			// Fast path: return cached creds if still fresh. This keeps
+			// reconnects working even after WireGuard captures system DNS.
+			p.credsMu.Lock()
+			if p.cachedUser != "" && time.Now().Before(p.cachedExpires) {
+				u, pw, a := p.cachedUser, p.cachedPass, p.cachedAddr
+				p.credsMu.Unlock()
+				return u, pw, a, nil
+			}
+			p.credsMu.Unlock()
+
+			user, pass, addr, err := getVKCreds(s, dialer, p.requestCaptcha)
+			if err != nil {
+				return "", "", "", err
+			}
+
+			p.credsMu.Lock()
+			p.cachedUser = user
+			p.cachedPass = pass
+			p.cachedAddr = addr
+			p.cachedExpires = time.Now().Add(turnCredsCacheLifetime)
+			p.credsMu.Unlock()
+
+			return user, pass, addr, nil
 		},
 	}
 
