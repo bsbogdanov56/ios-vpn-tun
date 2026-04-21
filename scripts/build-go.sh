@@ -88,7 +88,12 @@ info "Go module directory: $GO_MODULE_DIR"
 info "Building iOS arm64 c-archive library..."
 cd "$GO_MODULE_DIR"
 
-go build \
+# Resolve and tidy dependencies first — fetches any new modules added to go.mod
+info "Resolving Go module dependencies..."
+GOFLAGS="-mod=mod" go mod download 2>&1 || error "go mod download failed."
+GOFLAGS="-mod=mod" go mod tidy 2>&1 || warn "go mod tidy reported issues (continuing)."
+
+GOFLAGS="-mod=mod" go build \
     -buildmode=c-archive \
     -o "../$OUTPUT_DIR/libvkturn.a" \
     . 2>&1 || error "Go build failed. Check compilation errors above."
