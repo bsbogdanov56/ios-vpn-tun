@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -61,6 +62,40 @@ func applyBrowserHeaders(req *fhttp.Request) {
 	req.Header.Set("User-Agent", browserUserAgent)
 	req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+}
+
+// fetchCaptchaImageDataURL downloads the VK captcha PNG using the same tls-client
+// (carrying the cookies from our step 2 session) and encodes it into a
+// `data:image/png;base64,...` URL suitable for SwiftUI's AsyncImage.
+func fetchCaptchaImageDataURL(ctx context.Context, client tlsclient.HttpClient, imgURL string) (string, error) {
+	req, err := fhttp.NewRequestWithContext(ctx, "GET", imgURL, nil)
+	if err != nil {
+		return "", err
+	}
+	applyBrowserHeaders(req)
+	req.Header.Set("Accept", "image/webp,image/png,image/*,*/*;q=0.8")
+	req.Header.Set("Referer", "https://id.vk.ru/")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// Cap size to 1 MB — real captchas are ~5-30 KB.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("empty image body")
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" || !strings.HasPrefix(ct, "image/") {
+		ct = "image/png"
+	}
+	return "data:" + ct + ";base64," + base64.StdEncoding.EncodeToString(data), nil
 }
 
 // ------------ Captcha error parsing ------------
@@ -246,8 +281,17 @@ func getVKCreds(link string, dialer *dnsdialer.Dialer, captcha CaptchaCallback) 
 			return "", "", "", fmt.Errorf("step2 captcha required but no callback provided | body=%s", debugResp(resp))
 		}
 
+		// Download the captcha image ourselves (through the same tls-client session
+		// that VK issued the challenge for — otherwise VK returns "update the app"
+		// to fresh requests from AsyncImage). Encode as data: URL so Swift can
+		// render it directly without making its own HTTP request.
+		imgForUser := capErr.CaptchaImg
+		if dataURL, fetchErr := fetchCaptchaImageDataURL(ctx, client, capErr.CaptchaImg); fetchErr == nil && dataURL != "" {
+			imgForUser = dataURL
+		}
+
 		// Ask user to solve
-		answer, solveErr := captcha(capErr.CaptchaSid, capErr.CaptchaImg)
+		answer, solveErr := captcha(capErr.CaptchaSid, imgForUser)
 		if solveErr != nil {
 			return "", "", "", fmt.Errorf("captcha callback: %w", solveErr)
 		}

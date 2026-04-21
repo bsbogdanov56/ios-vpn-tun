@@ -100,31 +100,7 @@ struct CaptchaView: View {
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
 
-            AsyncImage(url: URL(string: imgURL)) { phase in
-                switch phase {
-                case .empty:
-                    ProgressView()
-                        .frame(height: 80)
-                case .success(let image):
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxHeight: 140)
-                        .background(Color.white)
-                        .cornerRadius(6)
-                case .failure:
-                    VStack {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.largeTitle)
-                            .foregroundColor(.orange)
-                        Text("Не удалось загрузить картинку")
-                            .font(.footnote)
-                    }
-                    .frame(height: 100)
-                @unknown default:
-                    ProgressView()
-                }
-            }
+            captchaImageView
 
             TextField("Ответ", text: $answer)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
@@ -157,5 +133,59 @@ struct CaptchaView: View {
             Spacer()
         }
         .padding()
+    }
+
+    /// Renders either a remote URL via AsyncImage or a `data:image/...;base64,...`
+    /// URL by decoding the bytes directly (URLSession doesn't fetch data: URLs).
+    @ViewBuilder
+    private var captchaImageView: some View {
+        if imgURL.hasPrefix("data:") {
+            if let uiImage = decodeDataURLImage(imgURL) {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxHeight: 140)
+                    .background(Color.white)
+                    .cornerRadius(6)
+            } else {
+                errorImagePlaceholder
+            }
+        } else {
+            AsyncImage(url: URL(string: imgURL)) { phase in
+                switch phase {
+                case .empty:
+                    ProgressView().frame(height: 80)
+                case .success(let image):
+                    image
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxHeight: 140)
+                        .background(Color.white)
+                        .cornerRadius(6)
+                case .failure:
+                    errorImagePlaceholder
+                @unknown default:
+                    ProgressView()
+                }
+            }
+        }
+    }
+
+    private var errorImagePlaceholder: some View {
+        VStack {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.largeTitle)
+                .foregroundColor(.orange)
+            Text("Не удалось загрузить картинку")
+                .font(.footnote)
+        }
+        .frame(height: 100)
+    }
+
+    private func decodeDataURLImage(_ url: String) -> UIImage? {
+        guard let commaIdx = url.firstIndex(of: ",") else { return nil }
+        let base64Part = String(url[url.index(after: commaIdx)...])
+        guard let data = Data(base64Encoded: base64Part) else { return nil }
+        return UIImage(data: data)
     }
 }
