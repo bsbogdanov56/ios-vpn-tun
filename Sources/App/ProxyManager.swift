@@ -21,6 +21,9 @@ final class ProxyManager: ObservableObject {
     private var statusTimer: Timer?
     private let maxLogEntries = 200
     private var lastCaptchaSid: String? = nil
+    /// Set to true right before we submit a captcha answer/token. Tells the
+    /// sheet-dismiss handler that the upcoming dismissal is NOT a user cancel.
+    private var captchaSubmissionInFlight: Bool = false
 
     deinit {
         Task { @MainActor in
@@ -86,6 +89,7 @@ final class ProxyManager: ObservableObject {
         let handle = proxyHandle
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         addLog("Submitting captcha: \(trimmed)")
+        captchaSubmissionInFlight = true
         Task.detached {
             let ok = VKTurnBridge.submitCaptcha(handle: handle, answer: trimmed)
             await MainActor.run { [weak self] in
@@ -103,6 +107,7 @@ final class ProxyManager: ObservableObject {
     func submitSuccessToken(_ token: String) {
         let handle = proxyHandle
         addLog("Submitting success_token (len=\(token.count))")
+        captchaSubmissionInFlight = true
         Task.detached {
             let ok = VKTurnBridge.submitSuccessToken(handle: handle, token: token)
             await MainActor.run { [weak self] in
@@ -117,7 +122,24 @@ final class ProxyManager: ObservableObject {
         captchaRedirectURL = nil
     }
 
+    /// Called from the sheet Binding when the sheet dismisses for any reason.
+    /// We only treat it as a real cancel if no submission is in flight.
+    func sheetDismissed() {
+        if captchaSubmissionInFlight {
+            captchaSubmissionInFlight = false
+            return
+        }
+        captchaImgURL = nil
+        captchaSid = nil
+        captchaRedirectURL = nil
+        if isRunning {
+            Task { await disconnect() }
+        }
+    }
+
+    /// Explicit "Отмена" button in the WebView.
     func cancelCaptcha() {
+        captchaSubmissionInFlight = false
         captchaImgURL = nil
         captchaSid = nil
         captchaRedirectURL = nil

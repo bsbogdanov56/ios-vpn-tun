@@ -70,9 +70,7 @@ struct ContentView: View {
         .sheet(isPresented: Binding(
             get: { proxyManager.captchaRedirectURL != nil },
             set: { newValue in
-                if !newValue {
-                    proxyManager.cancelCaptcha()
-                }
+                if !newValue { proxyManager.sheetDismissed() }
             }
         )) {
             if let url = proxyManager.captchaRedirectURL {
@@ -85,14 +83,11 @@ struct ContentView: View {
                 )
             }
         }
-        // Fallback: plain captcha image modal if VK for some reason didn't
-        // give a redirect_uri (rare).
+        // Fallback: plain captcha image modal if VK didn't provide redirect_uri.
         .sheet(isPresented: Binding(
             get: { proxyManager.captchaImgURL != nil && proxyManager.captchaRedirectURL == nil },
             set: { newValue in
-                if !newValue {
-                    proxyManager.captchaImgURL = nil
-                }
+                if !newValue { proxyManager.sheetDismissed() }
             }
         )) {
             if let imgURL = proxyManager.captchaImgURL {
