@@ -58,6 +58,19 @@ func humanDelay(minMs, maxMs int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
+// Small pool of Russian-sounding names — VK expects a real-looking display name,
+// not something like "123".
+var callerNames = []string{
+	"Александр", "Алексей", "Андрей", "Дмитрий", "Максим",
+	"Сергей", "Иван", "Михаил", "Николай", "Павел",
+	"Анна", "Мария", "Екатерина", "Ольга", "Татьяна",
+	"Елена", "Юлия", "Ирина", "Наталья",
+}
+
+func randomName() string {
+	return callerNames[rand.Intn(len(callerNames))]
+}
+
 func getCustomNetDialer() net.Dialer {
 	return net.Dialer{
 		Timeout:   20 * time.Second,
@@ -489,11 +502,22 @@ func getVKCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 		return "", "", "", fmt.Errorf("step1 no access_token | body=%s", debugResp(resp))
 	}
 
+	// Small delay to mimic real browser timing
+	humanDelay(100, 200)
+
+	// === Step 1.5: getCallPreview (session warmup — VK expects this preliminary call)
+	previewData := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&fields=photo_200&access_token=%s", link, token1)
+	previewURL := "https://api.vk.ru/method/calls.getCallPreview?v=5.275&client_id=6287487"
+	_, _, _ = doRequest(previewData, previewURL) // Warning if fails, not fatal — same as cacggghp
+
+	humanDelay(200, 400)
+
 	// === Step 2: call-specific token (with captcha retry) ===
+	callerName := neturl.QueryEscape(randomName())
 	makeStep2Data := func(extraCaptcha string) string {
-		return fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s%s", link, token1, extraCaptcha)
+		return fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s%s", link, callerName, token1, extraCaptcha)
 	}
-	step2URL := "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
+	step2URL := "https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=6287487"
 
 	resp, raw, err = doRequest(makeStep2Data(""), step2URL)
 	if err != nil {
