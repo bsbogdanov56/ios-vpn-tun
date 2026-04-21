@@ -23,10 +23,13 @@ import (
 // Returning error aborts the credential fetch.
 type CaptchaCallback func(captchaSid, captchaImg string) (answer string, err error)
 
-// iOS Safari profile — matches actual iPhone client so VK doesn't flag
-// mobile IP + desktop UA mismatch.
+// Chrome Windows profile — matches alxmcp's proven working config.
+// VK expects the web client_id (6287487) to come from a desktop-class browser.
 const (
-	browserUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+	browserUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+	browserSecChUa       = `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`
+	browserSecChUaMobile = "?0"
+	browserSecChUaPlat   = `"Windows"`
 )
 
 func debugResp(resp map[string]any) string {
@@ -52,16 +55,17 @@ func newTLSClient() (tlsclient.HttpClient, error) {
 	jar := tlsclient.NewCookieJar()
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
 		tlsclient.WithTimeoutSeconds(30),
-		tlsclient.WithClientProfile(profiles.Safari_IOS_17_0),
+		tlsclient.WithClientProfile(profiles.Chrome_146),
 		tlsclient.WithCookieJar(jar),
 	)
 }
 
-// iOS Safari doesn't send sec-ch-* headers; keep this minimal and consistent.
 func applyBrowserHeaders(req *fhttp.Request) {
 	req.Header.Set("User-Agent", browserUserAgent)
-	req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("sec-ch-ua", browserSecChUa)
+	req.Header.Set("sec-ch-ua-mobile", browserSecChUaMobile)
+	req.Header.Set("sec-ch-ua-platform", browserSecChUaPlat)
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 }
 
 // fetchCaptchaImageDataURL downloads the VK captcha PNG using the same tls-client
