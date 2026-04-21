@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	neturl "net/url"
 	"regexp"
 	"strconv"
@@ -114,8 +116,10 @@ func parseVkCaptchaError(errData map[string]any) *vkCaptchaError {
 }
 
 func newHTTPClient(dialer *dnsdialer.Dialer) *http.Client {
+	jar, _ := cookiejar.New(nil)
 	return &http.Client{
 		Timeout: 30 * time.Second,
+		Jar:     jar,
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 100,
@@ -123,6 +127,11 @@ func newHTTPClient(dialer *dnsdialer.Dialer) *http.Client {
 			DialContext:         dialer.DialContext,
 		},
 	}
+}
+
+func humanDelay(minMs, maxMs int) {
+	ms := minMs + rand.Intn(maxMs-minMs+1)
+	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
 func applyBrowserHeaders(req *http.Request) {
@@ -140,17 +149,71 @@ func generateBrowserFp() string {
 	return hex.EncodeToString(h[:])
 }
 
+// generateFakeCursor produces a human-like mouse path toward a ~center-screen target.
+// Uses a curved Bezier-ish trajectory with micro-jitter, ease-in/ease-out timing,
+// an overshoot+correction near the end, and a brief hover pause before click.
 func generateFakeCursor() string {
-	startX := 600 + rand.Intn(400)
-	startY := 300 + rand.Intn(200)
-	startTime := time.Now().UnixMilli() - int64(rand.Intn(2000)+1000)
+	startX := 50 + rand.Intn(200)
+	startY := 700 + rand.Intn(150)
+	endX := 850 + rand.Intn(150)
+	endY := 450 + rand.Intn(120)
+
+	// Control point above the straight line for an arc
+	ctrlX := (startX+endX)/2 + rand.Intn(120) - 60
+	ctrlY := (startY+endY)/2 - 120 - rand.Intn(150)
+
+	steps := 45 + rand.Intn(25) // 45..70 points
+	totalDur := 900 + rand.Intn(700)
+	now := time.Now().UnixMilli()
+	baseT := now - int64(totalDur) - int64(rand.Intn(500))
+
 	var points []string
-	for i := 0; i < 15+rand.Intn(10); i++ {
-		startX += rand.Intn(15) - 5
-		startY += rand.Intn(15) + 2
-		startTime += int64(rand.Intn(40) + 10)
-		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d,"t":%d}`, startX, startY, startTime))
+	px, py := startX, startY
+
+	for i := 0; i <= steps; i++ {
+		// ease-in/out progress
+		t := float64(i) / float64(steps)
+		eased := 0.5 - 0.5*math.Cos(t*math.Pi)
+
+		// Quadratic Bezier: B(t) = (1-t)^2*P0 + 2(1-t)t*P1 + t^2*P2
+		one := 1 - eased
+		bx := one*one*float64(startX) + 2*one*eased*float64(ctrlX) + eased*eased*float64(endX)
+		by := one*one*float64(startY) + 2*one*eased*float64(ctrlY) + eased*eased*float64(endY)
+
+		// micro-jitter
+		jx := rand.Intn(5) - 2
+		jy := rand.Intn(5) - 2
+
+		px = int(bx) + jx
+		py = int(by) + jy
+
+		// time: roughly follows easing too, plus small random jitter
+		tMs := baseT + int64(float64(totalDur)*eased) + int64(rand.Intn(8))
+		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d,"t":%d}`, px, py, tMs))
 	}
+
+	// Overshoot + correction near the end
+	overX := endX + rand.Intn(18) + 6
+	overY := endY + rand.Intn(10) - 4
+	overT := now - int64(rand.Intn(160)+80)
+	points = append(points, fmt.Sprintf(`{"x":%d,"y":%d,"t":%d}`, overX, overY, overT))
+
+	// correction back toward endX/endY
+	for i := 0; i < 3+rand.Intn(3); i++ {
+		cx := endX + rand.Intn(5) - 2
+		cy := endY + rand.Intn(5) - 2
+		ct := overT + int64((i+1)*20+rand.Intn(15))
+		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d,"t":%d}`, cx, cy, ct))
+	}
+
+	// brief hover (couple of points near-still)
+	for i := 0; i < 2+rand.Intn(2); i++ {
+		hx := endX + rand.Intn(3) - 1
+		hy := endY + rand.Intn(3) - 1
+		ht := now - int64(rand.Intn(50))
+		points = append(points, fmt.Sprintf(`{"x":%d,"y":%d,"t":%d}`, hx, hy, ht))
+	}
+
 	return "[" + strings.Join(points, ",") + "]"
 }
 
@@ -278,7 +341,7 @@ func callCaptchaNotRobot(client *http.Client, sessionToken, hash string) (string
 	if _, _, err := vkReq("captchaNotRobot.settings", baseParams); err != nil {
 		return "", fmt.Errorf("settings: %w", err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	humanDelay(1200, 2800)
 
 	browserFp := generateBrowserFp()
 	deviceJSON := buildCaptchaDeviceJSON()
@@ -286,7 +349,7 @@ func callCaptchaNotRobot(client *http.Client, sessionToken, hash string) (string
 	if _, _, err := vkReq("captchaNotRobot.componentDone", componentDoneData); err != nil {
 		return "", fmt.Errorf("componentDone: %w", err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	humanDelay(1200, 2800)
 
 	cursorJSON := generateFakeCursor()
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
@@ -321,7 +384,7 @@ func callCaptchaNotRobot(client *http.Client, sessionToken, hash string) (string
 		return "", fmt.Errorf("check no success_token | body=%s", truncateStr(raw, 300))
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	humanDelay(1200, 2800)
 	_, _, _ = vkReq("captchaNotRobot.endSession", baseParams)
 
 	return successToken, nil
@@ -340,10 +403,17 @@ func solveVkCaptcha(client *http.Client, capErr *vkCaptchaError) (string, error)
 		return "", fmt.Errorf("bootstrap: %w", err)
 	}
 
+	// Simulate user "noticing" the captcha page — real humans don't instantly
+	// click. PoW solve below runs ~0.1-2 sec anyway; add extra jitter.
+	humanDelay(800, 1800)
+
 	hash := solvePoW(bootstrap.PowInput, bootstrap.Difficulty)
 	if hash == "" {
 		return "", fmt.Errorf("PoW solve failed (difficulty=%d)", bootstrap.Difficulty)
 	}
+
+	// After seeing the checkbox + solving PoW, human would pause briefly before clicking.
+	humanDelay(500, 1500)
 
 	return callCaptchaNotRobot(client, capErr.SessionToken, hash)
 }
